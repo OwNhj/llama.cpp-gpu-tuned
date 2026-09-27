@@ -965,6 +965,13 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32_raw(uint8_t x) {
 // pp512 on Qwen3.8-27B: 1375 with the branch against 1500 branchless, which is the same as
 // MXFP4's. Exact for every code in 0x00..0x7E, i.e. every legal UE4M3 scale; 0x7F is NaN.
 static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32_raw_fast(uint8_t x) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    // RDNA4 (gfx1200/gfx1201) OCP e4m3 -> f32: __builtin_amdgcn_cvt_f32_fp8.
+    // No 0x7F guard: the ue4m3 scale quantizer never emits that code (it clamps candidates to
+    // 0x01..0x7E, see quantize_row_mxfp4_e4m3_impl), so it cannot occur in a legal file.
+    // Verified bit-identical to the software path for every code in 0x00..0x7E.
+    return __builtin_amdgcn_cvt_f32_fp8((uint32_t) x, 0);
+#else
     const uint32_t exp = (x >> 3) & 0xF;
     const uint32_t man = x & 0x7;
     // normal: (1 + man/8) * 2^(exp-7); +127 for the f32 bias, man lands at bit 20
@@ -973,6 +980,7 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32_raw_fast(uint8_t
     memcpy(&nrm, &nb, sizeof(float));
     const float sub = (float) man * (1.0f / 512.0f); // subnormal: man * 2^-9, exact
     return exp == 0 ? sub : nrm;
+#endif // defined(GGML_USE_HIP) && defined(RDNA4)
 }
 
 // Signed e4m3 -> f32: the decode convention the F8 KV cache is written with, matching
