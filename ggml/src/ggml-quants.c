@@ -462,6 +462,79 @@ static void quantize_row_mxfp4_impl(const float * GGML_RESTRICT x, block_mxfp4 *
     }
 }
 
+// GPTQ/OBS quantization of one output row to MXFP4. After quantizing each element,
+// the remaining (not yet quantized) columns are compensated via the preprocessed
+// upper-triangular factor U of inv(H): w[m] -= (w[j]-q)*scale * U[j][m] / U[j][j].
+// wbuf is a scratch buffer of k floats provided by the caller.
+void quantize_row_mxfp4_gptq(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k,
+                             const float * GGML_RESTRICT quant_weights, float * GGML_RESTRICT wbuf,
+                             const float * GGML_RESTRICT U, const float * GGML_RESTRICT udiag) {
+    static const int qk = QK_MXFP4;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    memcpy(wbuf, x, k * sizeof(float));
+    float * w = wbuf;
+
+    for (int i = 0; i < nb; i++) {
+        const float * qw = quant_weights + i*qk;
+
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            amax = MAX(amax, fabsf(w[i*qk + j]));
+        }
+
+        const uint8_t e0 = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
+
+        // grid search over candidate E8M0 exponents on the compensated weights
+        uint8_t e = e0;
+        float best_sse = FLT_MAX;
+
+        for (int d = -6; d <= 1; ++d) {
+            const int ei = (int) e0 + d;
+            if (ei < 0 || ei > 254) {
+                continue;
+            }
+            const float scale = GGML_E8M0_TO_FP32_HALF((uint8_t) ei);
+            float sse = 0.0f;
+            for (int j = 0; j < qk; j++) {
+                const float err = w[i*qk + j] - kvalues_mxfp4[best_index_mxfp4(w[i*qk + j], scale)]*scale;
+                sse += qw[j]*err*err;
+            }
+            if (sse < best_sse) {
+                best_sse = sse;
+                e = (uint8_t) ei;
+            }
+        }
+
+        const float scale = GGML_E8M0_TO_FP32_HALF(e);
+        y[i].e = e;
+
+        for (int j = 0; j < qk; ++j) {
+            const int64_t col = i*qk + j;
+            const uint8_t q = best_index_mxfp4(w[col], scale);
+
+            if (j < qk/2) {
+                y[i].qs[j] = q;
+            } else {
+                y[i].qs[j - qk/2] |= q << 4;
+            }
+
+            const float err = w[col] - kvalues_mxfp4[q]*scale;
+            if (err != 0.0f) {
+                const float coef = err / udiag[col];
+                const float * Urow = U + col*k;
+                #pragma omp simd
+                for (int64_t m = col + 1; m < k; ++m) {
+                    w[m] -= coef * Urow[m];
+                }
+            }
+        }
+    }
+}
+
 void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;
@@ -6483,4 +6556,26 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
     }
 
     return true;
+}
+
+// MXFP4 radiance plane layout dequant (CPU ref path; the fast path is the CUDA GEMM).
+// buffer for one tensor-row of K elems: nb*16 interleaved code bytes + nb e8m0 scales.
+void dequantize_row_mxfp4_rad(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP4;
+    const uint8_t * row = (const uint8_t *) vx;
+    const int64_t nb = k / qk;
+    const uint8_t * qs_plane = row;
+    const uint8_t * sc_plane = row + nb * 16;
+
+    for (int64_t b = 0; b < nb; b++) {
+        const float d = GGML_E8M0_TO_FP32_HALF(sc_plane[b]);
+        const uint8_t * out = qs_plane + b * 16;
+        // radi byte m (m<8): lo=elem 2m, hi=elem 2m+1; radi byte 8+m: lo=elem 16+2m, hi=elem 16+2m+1
+        for (int m = 0; m < 8; ++m) {
+            y[b*qk + 2*m + 0]        = kvalues_mxfp4[out[m] & 0x0F]*d;
+            y[b*qk + 2*m + 1]        = kvalues_mxfp4[out[m] >> 4]*d;
+            y[b*qk + 16 + 2*m + 0]   = kvalues_mxfp4[out[8+m] & 0x0F]*d;
+            y[b*qk + 16 + 2*m + 1]   = kvalues_mxfp4[out[8+m] >> 4]*d;
+        }
+    }
 }
