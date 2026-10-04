@@ -452,6 +452,8 @@ extern "C" {
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
         size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
+        const char * tt_errors_file;                                // append per-tensor quantization error stats to this CSV, nullptr = off
+        const char * gptq_u_dir;                                    // directory with preprocessed GPTQ U factors, nullptr = off
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
