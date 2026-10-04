@@ -775,6 +775,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp8,
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp8_ref,
     },
+    [GGML_TYPE_MXFP4_RAD] = {
+        .type_name                = "mxfp4_rad",
+        .blck_size                = QK_MXFP4,
+        .type_size                = sizeof(block_mxfp4), // 17B per 32 elems, same budget as mxfp4
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4_rad,
+        .from_float_ref           = NULL,
+    },
     [GGML_TYPE_MXFP6] = {
         .type_name                = "mxfp6",
         .blck_size                = QK_MXFP6,

@@ -1949,6 +1949,70 @@ __global__ void quantize_tokens_fp8(const float * __restrict__ x, int64_t sx, in
 }
 
 // public entries (declared in radiance-gemm.cuh)
+// MXFP4_RAD zero-copy: buffer holds per tensor row [nb*16 interleaved codes][nb e8m0 scales]
+// (row-major scales). radiance wants Ws[b*N + n]; gather once per tensor.
+__global__ void radiance_gather_scales_kernel(const unsigned char * __restrict__ src_rad, int N, int nb,
+                                              unsigned char * __restrict__ Ws,
+                                              unsigned char * __restrict__ Wref) {
+    // rad2 layout: code plane [N][nb*16] at offset 0, scale plane [N][nb] at offset N*nb*16
+    const int n = blockIdx.x;               // one row per block
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const unsigned char * sc = src_rad + (int64_t)N * nb * 16 + (int64_t)n * nb;
+    uint8_t lmax = 0;
+    for (int b = tid; b < nb; b += stride) {
+        const uint8_t e = sc[b];
+        Ws[(int64_t)b * gridDim.x + n] = e;
+        if (e > lmax) lmax = e;
+    }
+    __shared__ uint8_t shmax[256];
+    shmax[tid] = lmax;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && shmax[tid + off] > shmax[tid]) shmax[tid] = shmax[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) Wref[n] = shmax[0];
+}
+
+// MXFP4_RAD -> standard mxfp4 (17B blocks: e8m0 + 16B split-half codes), inverse of the
+// plane transform. Used once per tensor when decode (MMQ/MMVQ) needs the raw layout.
+__global__ void radiance_unrad_kernel(const unsigned char * __restrict__ src_rad, int N, int nb,
+                                      unsigned char * __restrict__ dst_raw) {
+    // rad2 layout: code plane at 0, scale plane at N*nb*16
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const unsigned char * qs = src_rad + (int64_t)n * (nb * 16);
+    const unsigned char * sc = src_rad + (int64_t)N * nb * 16 + (int64_t)n * nb;
+    unsigned char * out = dst_raw + (int64_t)n * nb * 17;
+    for (int b = tid; b < nb; b += stride) {
+        unsigned char * blk = out + (int64_t)b * 17;
+        blk[0] = sc[b];
+        const unsigned char * p = qs + b * 16;
+        // radi byte m (m<8):   lo nibble = elem 2m,   hi nibble = elem 2m+1
+        // radi byte 8+m:       lo nibble = elem 16+2m, hi nibble = elem 16+2m+1
+        // llama byte j:        lo nibble = elem j,   hi nibble = elem 16+j
+        unsigned char elem[32];
+        for (int m = 0; m < 8; ++m) {
+            elem[2*m]     = p[m] & 0x0F;
+            elem[2*m+1]   = p[m] >> 4;
+            elem[16+2*m]  = p[8+m] & 0x0F;
+            elem[16+2*m+1]= p[8+m] >> 4;
+        }
+        for (int j = 0; j < 16; ++j) {
+            blk[1 + j] = elem[j] | (elem[16 + j] << 4);
+        }
+    }
+}
+
+void ggml_cuda_radiance_gather_scales(const unsigned char * src_rad, int N, int K,
+                                      unsigned char * Ws, unsigned char * Wref,
+                                      cudaStream_t stream) {
+    const int nb = (int)(K / 32);
+    radiance_gather_scales_kernel<<<N, 256, 0, stream>>>(src_rad, N, nb, Ws, Wref);
+}
+
 void ggml_cuda_radiance_repack(const void * src_llama, int64_t s01, int N, int K,
                                void * W, void * Ws, void * Wref, cudaStream_t stream) {
     const int nb = K / 32;
@@ -2044,7 +2108,8 @@ bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t 
     //   M(tokens) >= 256 (decode stays on MMQ/MMVQ), K % 64 == 0 (BK=64), N % 16 == 0 (n-tile).
     //   Env GGML_RAD_PREFILL_MIN_M overrides the threshold for tuning.
     const int64_t min_m = getenv("GGML_RAD_PREFILL_MIN_M") ? atoll(getenv("GGML_RAD_PREFILL_MIN_M")) : 256;
-    return amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && type == GGML_TYPE_MXFP4 &&
+    const bool type_ok = type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP4_RAD;
+    return amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && type_ok &&
         ne11 >= min_m && ne00 % 64 == 0 && ne10 == ne00 && (ne01 % 16 == 0) && contiguous_dst;
 }
 

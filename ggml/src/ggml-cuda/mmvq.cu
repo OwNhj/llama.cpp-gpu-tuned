@@ -1,4 +1,9 @@
 #include "mmvq.cuh"
+#include <cstdlib>
+#include <unordered_map>
+#include "radiance-gemm.cuh"
+__global__ void radiance_unrad_kernel(const unsigned char * __restrict__ src_rad, int N, int nb,
+                                      unsigned char * __restrict__ dst_raw);
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -334,6 +339,11 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, int64_t nrows_x) {
     if (!ggml_is_quantized(type)) {
+        return false;
+    }
+    // GGML_RAD_DECODE=1: let the radiance decode kernel (not MMVQ) own MXFP4_RAD decode so the
+    // code/scale planes are read directly -> no unrad raw copy on the device.
+    if (type == GGML_TYPE_MXFP4_RAD && getenv("GGML_RAD_DECODE")) {
         return false;
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
@@ -1477,6 +1487,31 @@ static void mul_mat_vec_q_switch_type(
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_MXFP4_RAD:
+            {
+                static std::unordered_map<const void *, unsigned char *> g_rad_raw_mmvq;
+                unsigned char * raw = nullptr;
+                auto it = g_rad_raw_mmvq.find(vx);
+                cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+                const bool capturing = cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone;
+                if (it == g_rad_raw_mmvq.end()) {
+                    if (capturing) {
+                        GGML_ABORT("RAD mmvq cache miss during capture");
+                    }
+                    CUDA_CHECK(cudaMalloc(&raw, (size_t)nrows_x * (ncols_x / 32) * 17));
+                    radiance_unrad_kernel<<<(int)nrows_x, 256, 0, stream>>>(
+                        (const unsigned char *) vx, (int)nrows_x, (int)(ncols_x / 32), raw);
+                    CUDA_CHECK(cudaGetLastError());
+                    g_rad_raw_mmvq[vx] = raw;
+                } else {
+                    raw = it->second;
+                }
+                mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP4>
+                    (raw, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, ncols_x/32, stride_col_y, stride_col_dst,
+                     nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                     nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            }
             break;
         default:
             GGML_ABORT("fatal error");

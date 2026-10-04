@@ -433,6 +433,7 @@ extern "C" {
         GGML_TYPE_MXFP8   = 43, // MXFP8 (OCP MX block-scaled FP8 E4M3, 8.25 bpw)
         GGML_TYPE_F8      = 44, // F8 (E4M3 quants + F16 scale per 32 elems, KV-cache only, 8.5 bpw)
         GGML_TYPE_MXFP6   = 45, // MXFP6 (OCP MX block-scaled FP6 E2M3, 6.25 bpw)
+        GGML_TYPE_MXFP4_RAD = 47, // MXFP4 radiance plane layout (interleaved qs plane + row-major e8m0 scales), opaque
         GGML_TYPE_MXFP4_E4M3 = 46, // MXFP4 block-scaled E2M1 with a UE4M3 scale, 4.25 bpw
         // ROCmFPx experimental family (ported from the ROCmFPX fork, adapted to this MMQ).
         // Only Q4_0_ROCMI4 is exercised by the W4A4 path; the rest keep the fork numbering

@@ -1491,3 +1491,36 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+// MXFP4_RAD plane-row dot: convert the plane row (nb*16 interleaved codes + nb scales) into
+// standard mxfp4 17B blocks on the fly, then reuse the plain mxfp4 dot.
+void ggml_vec_dot_mxfp4_rad_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    // vx points to nrc consecutive RAD rows (row stride = nb*17 bytes = bx).
+    // convert each row to a standard mxfp4 block array, then reuse the plain dot.
+    static _Thread_local uint8_t conv[2*16384];
+    const int64_t nb = n / 32;
+    const int64_t row_bytes = nb * 17;
+    const uint8_t * base = (const uint8_t *) vx;
+    uint8_t * out = conv;
+    for (int r = 0; r < nrc; r++) {
+        const uint8_t * row = base + r * bx;
+        const uint8_t * qs = row;
+        const uint8_t * sc = row + nb * 16;
+        for (int64_t b = 0; b < nb; b++) {
+            uint8_t * blk = out + r * row_bytes + b * 17;
+            blk[0] = sc[b];
+            const uint8_t * p = qs + b * 16;
+            unsigned char elem[32];
+            for (int m = 0; m < 8; ++m) {
+                elem[2*m]     = p[m] & 0x0F;
+                elem[2*m+1]   = p[m] >> 4;
+                elem[16+2*m]  = p[8+m] & 0x0F;
+                elem[16+2*m+1]= p[8+m] >> 4;
+            }
+            for (int j = 0; j < 16; ++j) {
+                blk[1 + j] = elem[j] | (elem[16 + j] << 4);
+            }
+        }
+    }
+    ggml_vec_dot_mxfp4_q8_0(n, s, bs, out, row_bytes, vy, by, nrc);
+}

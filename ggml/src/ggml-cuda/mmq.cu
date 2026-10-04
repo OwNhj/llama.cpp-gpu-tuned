@@ -7,6 +7,19 @@
 #include <cstdint>
 #include <unordered_map>
 
+
+// --- MXFP4_RAD decode fallback helpers (definitions live in the radiance section below) ---
+struct ggml_radiance_weight;
+static unsigned char * ggml_rad_raw_copy(const unsigned char * src_rad, int N, int nb, cudaStream_t stream);
+
+
+// forward decls from radiance-gemm.cu (gfx1200 single TU build)
+__global__ void radiance_unrad_kernel(const unsigned char * __restrict__ src_rad, int N, int nb,
+                                      unsigned char * __restrict__ dst_raw);
+void ggml_cuda_radiance_gather_scales(const unsigned char * src_rad, int N, int K,
+                                      unsigned char * Ws, unsigned char * Wref,
+                                      cudaStream_t stream);
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -82,6 +95,21 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_MXFP4:
             mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
             break;
+        case GGML_TYPE_MXFP4_RAD:
+            {
+                const int64_t N = args.nrows_x;
+                const int64_t nb = args.ncols_x / 32;
+                unsigned char * raw = ggml_rad_raw_copy((const unsigned char *) args.x, (int)N, (int)nb, stream);
+                if (raw == nullptr) {
+                    // cache miss under graph capture: cannot allocate now, fail this path
+                    GGML_ABORT("RAD raw copy missing during capture");
+                }
+                mmq_args a2 = args;
+                a2.x = (const char *) raw;
+                a2.type_x = GGML_TYPE_MXFP4;
+                mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, a2, stream);
+            }
+            break;
         case GGML_TYPE_NVFP4:
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
             break;
@@ -105,13 +133,37 @@ struct ggml_radiance_weight {
     void * Ws;
     void * Wref;
     int    device;
+    bool   own_w = true; // false when W aliases the weight buffer (MXFP4_RAD)
 };
 
 static std::unordered_map<const void *, ggml_radiance_weight> g_radiance_weights;
 
+static unsigned char * ggml_rad_raw_copy(const unsigned char * src_rad, int N, int nb, cudaStream_t stream) {
+    static std::unordered_map<const unsigned char *, unsigned char *> g_rad_raw;
+    static int g_dev = -1;
+    const int dev = ggml_cuda_get_device();
+    auto it = g_rad_raw.find(src_rad);
+    if (it == g_rad_raw.end() || g_dev != dev) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+            return nullptr; // caller must handle
+        }
+        unsigned char * p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, (size_t)N * nb * 17));
+        radiance_unrad_kernel<<<N, 256, 0, stream>>>(src_rad, N, nb, p);
+        CUDA_CHECK(cudaGetLastError());
+        g_rad_raw[src_rad] = p;
+        g_dev = dev;
+        return p;
+    }
+    return it->second;
+}
+
 static void ggml_cuda_free_radiance_weights() {
+    // W may point into the model weight buffer (MXFP4_RAD zero-copy); only owned
+    // allocations are freed. Track ownership via a flag inside the entry.
     for (auto & kv : g_radiance_weights) {
-        cudaFree(kv.second.W);
+        if (kv.second.own_w) cudaFree(kv.second.W);
         cudaFree(kv.second.Ws);
         cudaFree(kv.second.Wref);
     }
@@ -128,7 +180,7 @@ void ggml_cuda_invalidate_weight_caches(const void * base, size_t size) {
     for (auto it = g_radiance_weights.begin(); it != g_radiance_weights.end();) {
         const char * k = (const char *) it->first;
         if (k >= lo && k < hi) {
-            cudaFree(it->second.W);
+            if (it->second.own_w) cudaFree(it->second.W);   // RAD aliases the weight buffer: never free it
             cudaFree(it->second.Ws);
             cudaFree(it->second.Wref);
             it = g_radiance_weights.erase(it);
@@ -192,10 +244,21 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
         const size_t wq_bytes  = (size_t)N * K / 2;
         const size_t ws_bytes  = (size_t)N * (K / 32);
         const size_t wref_bytes = (size_t)N;
-        CUDA_CHECK(cudaMalloc(&w.W,    wq_bytes));
-        CUDA_CHECK(cudaMalloc(&w.Ws,   ws_bytes));
-        CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
-        ggml_cuda_radiance_repack(src0->data, K / 32, N, K, w.W, w.Ws, w.Wref, stream);
+        if (src0->type == GGML_TYPE_MXFP4_RAD) {
+            w.own_w = false;   // W aliases the weight buffer (full-plane rad2 layout)
+            // RAD rows are [nb*16 codes][nb scales] interleaved per row; the GEMM wants
+            // a contiguous W code plane, Ws[b*N+n] scale plane and Wref row-max. Build all
+            // three once from the weight buffer (scales/copies are small vs a full repack).
+            w.W = (unsigned char *) src0->data;   // code plane aliases the weight buffer
+            CUDA_CHECK(cudaMalloc(&w.Ws,   ws_bytes));
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales((const unsigned char *) src0->data, N, K, (unsigned char *) w.Ws, (unsigned char *) w.Wref, stream);
+        } else {
+            CUDA_CHECK(cudaMalloc(&w.W,    wq_bytes));
+            CUDA_CHECK(cudaMalloc(&w.Ws,   ws_bytes));
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_repack(src0->data, K / 32, N, K, w.W, w.Ws, w.Wref, stream);
+        }
         CUDA_CHECK(cudaGetLastError());
         it = g_radiance_weights.emplace(key, w).first;
     }
@@ -268,7 +331,7 @@ void ggml_cuda_mul_mat_q(
 
     const bool fallback = ne01 % 128 != 0;
 
-    const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+    const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_MXFP4_RAD || src0->type == GGML_TYPE_NVFP4);
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
@@ -292,7 +355,7 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
-            } else if ((src0->type == GGML_TYPE_MXFP8 || src0->type == GGML_TYPE_MXFP6 || src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_MXFP4_E4M3)
+            } else if ((src0->type == GGML_TYPE_MXFP8 || src0->type == GGML_TYPE_MXFP6 || src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_MXFP4_RAD || src0->type == GGML_TYPE_MXFP4_E4M3)
                        && GGML_CUDA_CC_IS_RDNA4(cc)) {
                 // e4m3 y tiles for the W8A8 fp8 WMMA path (RDNA4 only). NVFP4 is deliberately
                 // NOT here: its MMQ vec_dot is the mainline int8 one (q8_0_16), which consumes
@@ -377,7 +440,7 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
-        } else if ((src0->type == GGML_TYPE_MXFP8 || src0->type == GGML_TYPE_MXFP6 || src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_MXFP4_E4M3)
+        } else if ((src0->type == GGML_TYPE_MXFP8 || src0->type == GGML_TYPE_MXFP6 || src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_MXFP4_RAD || src0->type == GGML_TYPE_MXFP4_E4M3)
                    && GGML_CUDA_CC_IS_RDNA4(cc)) {
             // e4m3 y tiles for the W8A8 fp8 WMMA path (RDNA4 only); other archs fall through
             // to the q8_1 int8 y consumed by the mainline int8 vec_dots. NVFP4 is excluded here
@@ -456,6 +519,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ4_NL:
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP4_RAD:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_MXFP8:
         case GGML_TYPE_MXFP6:

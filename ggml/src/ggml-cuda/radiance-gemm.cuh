@@ -4,6 +4,10 @@
 
 // radiance MXFP4 x fp8 W8A8 WMMA GEMM fast path (RDNA4 prefill).
 // all entries assume ggml_cuda_radiance_supported() was true and buffers are device-side.
+void ggml_cuda_radiance_gather_scales(const unsigned char * src_rad, int N, int K,
+                                      unsigned char * Ws, unsigned char * Wref,
+                                      cudaStream_t stream);
+
 void ggml_cuda_radiance_repack(const void * src_llama, int64_t s01, int N, int K,
                                void * W, void * Ws, void * Wref, cudaStream_t stream);
 
