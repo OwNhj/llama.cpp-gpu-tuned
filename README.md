@@ -23,7 +23,15 @@
 > `v_wmma_i32_16x16x32_iu4` tensor core, ported from [ROCmFPX](https://github.com/charlie12345/ROCmFPX)
 > and re-adapted to this tree's MMQ. See [RDNA4 I4 W4A4](#rdna4-i4-w4a4) below.
 >
-> ### Building with the F8 KV cache
+> ### Calibration tooling in this fork
+
+This fork adds default-off offline quantization tooling: per-tensor quant error
+reporting (`llama-quantize --tt-errors`), Hessian collection
+(`llama-imatrix --hessian-dir`) and GPTQ-style requantization
+(`llama-quantize --gptq-u-dir`). See [CALIBRATION.md](CALIBRATION.md) for
+commands, corpus-shape notes and measured results.
+
+## Building with the F8 KV cache
 >
 > The F8 flash-attention K-V combinations are **not** in the default `GGML_CUDA_FA_QUANTS` list and
 > have to be enabled explicitly. Without them `-ctk f8` still works, but token generation falls back
