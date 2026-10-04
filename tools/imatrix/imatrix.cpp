@@ -16,6 +16,7 @@
 #include <mutex>
 #include <vector>
 #include <fstream>
+#include <filesystem>
 #include <unordered_map>
 #include <map>
 #include <regex>
@@ -55,6 +56,12 @@ struct tensor_statistics {
     float cossim       = 0.0f;
 };
 
+struct hessian_stats {
+    int64_t            K = 0;     // input dim (rows/cols of H)
+    int64_t            ntok = 0;  // accumulated token count
+    std::vector<float> h;         // full K*K row-major (upper triangle used)
+};
+
 class IMatrixCollector {
 public:
     IMatrixCollector() = default;
@@ -62,16 +69,21 @@ public:
     bool collect_imatrix(struct ggml_tensor * t, bool ask, void * user_data);
     void save_imatrix_legacy(int32_t ncall = -1) const;
     void save_imatrix(int32_t n_chunk = -1) const;
+    void save_hessian() const;
+    void set_hessian_dir(std::string dir) { m_hess_dir = std::move(dir); }
     bool load_imatrix(const char * file_name);
     const std::unordered_map<std::string, Stats> & get_mstats() const { return m_stats; }
 private:
-    std::unordered_map<std::string, Stats> m_stats;
+    void accumulate_hessian(const std::string & wname, const float * x, int64_t K, int64_t M);
+    std::unordered_map<std::string, Stats>         m_stats;
+    std::unordered_map<std::string, hessian_stats> m_hess;
     common_params                          m_params;
     std::mutex                             m_mutex;
     std::vector<std::string>               m_datasets;
     int32_t                                m_last_chunk = 0;
     std::vector<char>                      m_src1_data;
     std::vector<char>                      m_ids; // the expert ids from ggml_mul_mat_id
+    std::string                            m_hess_dir;
 };
 
 // remove any prefix and suffixes from the name
@@ -91,6 +103,45 @@ static std::string filter_tensor_name(const char * name) {
         wname = name;
     }
     return wname;
+}
+
+// accumulate full hessian H = sum_m x_m x_m^T (upper triangle, packed rows)
+// x is row-major [M, K]. called with m_mutex held.
+void IMatrixCollector::accumulate_hessian(const std::string & wname, const float * x, int64_t K, int64_t M) {
+    auto & hs = m_hess[wname];
+    if (hs.K == 0) {
+        hs.K = K;
+        hs.h.assign(K * (K + 1) / 2, 0.0f); // packed upper triangle
+    }
+    GGML_ASSERT(hs.K == K);
+    hs.ntok += M;
+    float * const GGML_RESTRICT h = hs.h.data();
+    const float * const GGML_RESTRICT x0 = x;
+    // block size tuned for L2: h block row stays hot across the M sweep
+    const int64_t B = 64;
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int64_t jb = 0; jb < K; jb += B) {
+        const int64_t jmax = std::min(jb + B, K);
+        for (int64_t kb = 0; kb <= jb; kb += B) {
+            const int64_t kmax = std::min(kb + B, K);
+            const bool diag_block = (kb == jb);
+            for (int64_t m = 0; m < M; ++m) {
+                const float * const GGML_RESTRICT xm = x0 + m * K;
+                for (int64_t j = jb; j < jmax; ++j) {
+                    const float xj = xm[j];
+                    const int64_t kend = diag_block ? std::min(kmax, j + 1) : kmax;
+                    const int64_t len = kend - kb;
+                    if (len <= 0) continue;
+                    float * const GGML_RESTRICT hj = h + j * (j + 1) / 2 + kb;
+                    const float * const GGML_RESTRICT xk = xm + kb;
+                    #pragma omp simd
+                    for (int64_t t = 0; t < len; ++t) {
+                        hj[t] += xj * xk[t];
+                    }
+                }
+            }
+        }
+    }
 }
 
 static void process_tensor_name(const std::string & input, std::string & layer, std::string & tensor) {
@@ -383,6 +434,23 @@ bool IMatrixCollector::collect_imatrix(struct ggml_tensor * t, bool ask, void * 
 
         const int64_t ne0 = src1->ne[0];
 
+        if (!m_hess_dir.empty() && n_mat == 1) {
+            // pack all activation rows into a contiguous [M, K] buffer, then full hessian
+            const int64_t M = src1->ne[1] * src1->ne[2] * src1->ne[3];
+            std::vector<float> xc(M * ne0);
+            int64_t mi = 0;
+            for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
+                for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
+                    for (int64_t row = 0; row < src1->ne[1]; ++row) {
+                        const float * xr = (const float *) (data + row * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
+                        memcpy(xc.data() + mi * ne0, xr, ne0 * sizeof(float));
+                        mi++;
+                    }
+                }
+            }
+            accumulate_hessian(wname, xc.data(), ne0, M);
+        }
+
         for (int64_t i3 = 0; i3 < src1->ne[3]; ++i3) {
             for (int64_t i2 = 0; i2 < src1->ne[2]; ++i2) {
                 // handle 3D+ tensors, but flatten 3D+ activations when model tensor is 2D
@@ -637,6 +705,38 @@ void IMatrixCollector::save_imatrix(int32_t n_chunk) const {
 
     gguf_free(ctx_gguf);
     ggml_free(ctx);
+}
+
+void IMatrixCollector::save_hessian() const {
+    if (m_hess_dir.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(m_hess_dir, ec);
+    if (ec) {
+        LOG_ERR("%s: cannot create hessian dir %s: %s\n", __func__, m_hess_dir.c_str(), ec.message().c_str());
+        return;
+    }
+    std::vector<std::string> names;
+    names.reserve(m_hess.size());
+    for (const auto & kv : m_hess) {
+        names.push_back(kv.first);
+    }
+    std::sort(names.begin(), names.end());
+    for (const auto & name : names) {
+        const auto & hs = m_hess.at(name);
+        const std::string fname = m_hess_dir + "/" + name + ".bin";
+        std::ofstream out(fname, std::ios::binary);
+        if (!out) {
+            LOG_ERR("%s: cannot write %s\n", __func__, fname.c_str());
+            continue;
+        }
+        out.write((const char *) &hs.K, sizeof(hs.K));
+        out.write((const char *) &hs.ntok, sizeof(hs.ntok));
+        out.write((const char *) hs.h.data(), hs.h.size() * sizeof(float));
+        LOG_INF("%s: wrote hessian %s K=%ld ntok=%ld (%.1f MB)\n", __func__, fname.c_str(),
+                (long) hs.K, (long) hs.ntok, hs.h.size() * sizeof(float) / 1e6);
+    }
 }
 
 bool IMatrixCollector::load_imatrix(const char * file_name) {
@@ -1086,7 +1186,22 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_IMATRIX, print_usage)) {
+    // custom option: --hessian-dir <dir> (full hessian collection for GPTQ)
+    // strip it from argv before common_params_parse, which rejects unknown args
+    std::vector<char *> pargv;
+    pargv.push_back(argv[0]);
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--hessian-dir") == 0 && i + 1 < argc) {
+            g_collector.set_hessian_dir(argv[i + 1]);
+            LOG_INF("%s: hessian collection enabled, output dir: %s\n", __func__, argv[i + 1]);
+            ++i; // skip the value too
+        } else {
+            pargv.push_back(argv[i]);
+        }
+    }
+    const int pargc = (int) pargv.size();
+
+    if (!common_params_parse(pargc, pargv.data(), params, LLAMA_EXAMPLE_IMATRIX, print_usage)) {
         return 1;
     }
 
@@ -1183,6 +1298,7 @@ int main(int argc, char ** argv) {
     }
 
     g_collector.save_imatrix();
+    g_collector.save_hessian();
 
     LOG("\n");
     llama_perf_context_print(ctx);

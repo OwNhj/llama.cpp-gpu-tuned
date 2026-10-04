@@ -4,6 +4,17 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+// local declarations for the GPTQ/OBS MXFP4 quantizer (defined in ggml-quants.c)
+// layout must match block_mxfp4 in ggml-common.h
+typedef struct {
+    uint8_t e;
+    uint8_t qs[16];
+} gptq_block_mxfp4;
+static_assert(sizeof(gptq_block_mxfp4) == 17, "wrong gptq_block_mxfp4 size");
+extern "C" void quantize_row_mxfp4_gptq(const float * x, gptq_block_mxfp4 * y, int64_t k,
+                                        const float * quant_weights, float * wbuf,
+                                        const float * U, const float * udiag);
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -187,6 +198,14 @@ struct quantize_state_impl {
     // tensor type override patterns (compiled once, used twice)
     std::vector<std::pair<std::regex, ggml_type>> tensor_type_patterns;
 
+    // GPTQ/OBS: directory with preprocessed U factors (one file per tensor)
+    std::string gptq_u_dir;
+
+    // current tensor's loaded U factor (loaded on demand, freed after use)
+    std::vector<float> gptq_U;
+    std::vector<float> gptq_udiag;
+    bool gptq_U_active = false;
+
     quantize_state_impl(const llama_model & model, const llama_model_quantize_params * params):
         model(model), params(params)
     {
@@ -196,6 +215,45 @@ struct quantize_state_impl {
                 tensor_type_patterns.emplace_back(std::regex(p->pattern), p->type);
             }
         }
+        if (params->gptq_u_dir) {
+            gptq_u_dir = params->gptq_u_dir;
+        }
+    }
+
+    // try to load the preprocessed U factor for a tensor; returns true if loaded
+    bool load_gptq_u(const std::string & name, int64_t n_per_row) {
+        gptq_U.clear();
+        gptq_udiag.clear();
+        gptq_U_active = false;
+        if (gptq_u_dir.empty()) {
+            return false;
+        }
+        const std::string fname = gptq_u_dir + "/" + name + ".bin";
+        std::ifstream in(fname, std::ios::binary);
+        if (!in) {
+            return false;
+        }
+        int64_t K = 0;
+        int64_t reserved = 0;
+        in.read((char *) &K, sizeof(K));
+        in.read((char *) &reserved, sizeof(reserved));
+        if (!in || K != n_per_row) {
+            LLAMA_LOG_WARN("%s: gptq U file %s has K=%ld, expected %ld - skipping\n", __func__, fname.c_str(), (long) K, (long) n_per_row);
+            return false;
+        }
+        gptq_U.resize(K * K);
+        gptq_udiag.resize(K);
+        in.read((char *) gptq_U.data(), K * K * sizeof(float));
+        in.read((char *) gptq_udiag.data(), K * sizeof(float));
+        if (!in) {
+            LLAMA_LOG_WARN("%s: failed to read gptq U file %s\n", __func__, fname.c_str());
+            gptq_U.clear();
+            gptq_udiag.clear();
+            return false;
+        }
+        gptq_U_active = true;
+        LLAMA_LOG_INFO("%s: loaded gptq U factor for %s (K=%ld)\n", __func__, name.c_str(), (long) K);
+        return true;
     }
 };
 
@@ -857,12 +915,64 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 
 // quantize rows [first_row, first_row + nrows), indexed globally across all expert matrices
 // note: chunks never cross an expert boundary since each expert has its own imatrix slice
-static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
+static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t first_row, int64_t nrows, int64_t nrows_per_expert, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread,
+                                         const float * gptq_U = nullptr, const float * gptq_udiag = nullptr) {
     const size_t row_size = ggml_row_size(new_type, n_per_row);
 
     auto imatrix_for_row = [=](int64_t row_global) {
         return imatrix ? imatrix + (row_global / nrows_per_expert) * n_per_row : nullptr;
     };
+
+    if (gptq_U != nullptr && new_type == GGML_TYPE_MXFP4) {
+        // GPTQ/OBS: rows are independent, quantize row-by-row with per-thread scratch
+        std::mutex mtx;
+        int64_t row_counter = 0;
+        size_t new_size = 0;
+        bool valid = true;
+        auto gptq_compute = [&]() {
+            std::vector<float> wbuf(n_per_row);
+            std::vector<float> ones;
+            size_t local = 0;
+            while (true) {
+                int64_t row;
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    if (row_counter >= nrows) break;
+                    row = row_counter++;
+                }
+                const int64_t row_global = first_row + row;
+                const float * im_row = imatrix_for_row(row_global);
+                if (im_row == nullptr) {
+                    if (ones.empty()) ones.assign(n_per_row, 1.0f);
+                    im_row = ones.data();
+                }
+                void * this_data = (char *) new_data + row * row_size;
+                quantize_row_mxfp4_gptq(f32_data + row * n_per_row, (gptq_block_mxfp4 *) this_data,
+                                        n_per_row, im_row, wbuf.data(), gptq_U, gptq_udiag);
+                size_t this_size = ggml_row_size(new_type, n_per_row);
+                if (!ggml_validate_row_data(new_type, this_data, this_size)) {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    valid = false;
+                    break;
+                }
+                local += this_size;
+            }
+            if (local > 0) {
+                std::lock_guard<std::mutex> lk(mtx);
+                new_size += local;
+            }
+        };
+        for (int it = 0; it < nthread - 1; ++it) {
+            workers.emplace_back(gptq_compute);
+        }
+        gptq_compute();
+        for (auto & w : workers) { w.join(); }
+        workers.clear();
+        if (!valid) {
+            throw std::runtime_error("quantized data validation failed");
+        }
+        return new_size;
+    }
 
     if (nthread < 2) {
         // single-thread
@@ -926,6 +1036,51 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
         throw std::runtime_error("quantized data validation failed");
     }
     return new_size;
+}
+
+//
+// per-tensor quantization error measurement (--tt-errors)
+//
+
+// accumulates row-wise round-trip error for one quantized slab: f32 weights vs the
+// dequantized result of the bytes produced by llama_tensor_quantize_impl
+// imatrix row indexing follows imatrix_for_row() in llama_tensor_quantize_impl
+static void llama_tensor_tt_measure(
+        ggml_type dst_type, const float * f32_data, const void * q_data, int64_t nrows_cur, int64_t n_per_row,
+        int64_t nrows_per_expert, int64_t first_row, const float * imatrix, std::vector<float> & dq_buf,
+        double & sse, double & ss, double & sse_im, double & ss_im, float & max_row, int64_t & bad_rows) {
+    const ggml_type_traits * tr = ggml_get_type_traits(dst_type);
+    if (tr->to_float == nullptr) {
+        throw std::runtime_error(format("no dequantization for type %s", ggml_type_name(dst_type)));
+    }
+    const int64_t nelements_cur = nrows_cur * n_per_row;
+    if (dq_buf.size() < (size_t)nelements_cur) {
+        dq_buf.resize(nelements_cur);
+    }
+    tr->to_float(q_data, dq_buf.data(), nelements_cur);
+
+    for (int64_t r = 0; r < nrows_cur; ++r) {
+        const float * w  = f32_data + (size_t)r*n_per_row;
+        const float * dq = dq_buf.data() + (size_t)r*n_per_row;
+        const float * im = imatrix ? imatrix + (first_row + r)/nrows_per_expert*n_per_row : nullptr;
+        double rsse = 0.0, rss = 0.0;
+        for (int64_t j = 0; j < n_per_row; ++j) {
+            const double d = (double)w[j] - (double)dq[j];
+            rsse += d*d;
+            rss  += (double)w[j]*w[j];
+            if (im) {
+                sse_im += (double)im[j]*d*d;
+                ss_im  += (double)im[j]*w[j]*w[j];
+            }
+        }
+        sse += rsse;
+        ss  += rss;
+        if (rss > 0.0) {
+            max_row = std::max(max_row, (float)std::sqrt(rsse/rss));
+        } else {
+            bad_rows++;
+        }
+    }
 }
 
 //
@@ -1191,6 +1346,18 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // flag for --dry-run
     bool will_require_imatrix = false;
 
+    // per-tensor error CSV (--tt-errors), one row per quantized tensor
+    std::ofstream tt_of;
+    if (params->tt_errors_file && params->tt_errors_file[0]) {
+        tt_of.open(params->tt_errors_file, std::ios::binary | std::ios::app);
+        if (!tt_of.is_open()) {
+            throw std::runtime_error(format("failed to open tt-errors file '%s'", params->tt_errors_file));
+        }
+        if (tt_of.tellp() == 0) {
+            tt_of << "name,src,dst,nrows,nelem,bytes,rmse,max_row,bad_rows,im_rmse\n";
+        }
+    }
+
     //
     // preliminary iteration over all weights
     //
@@ -1397,6 +1564,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
                 fflush(stdout);
 
+                double tt_sse = 0.0, tt_ss = 0.0, tt_sse_im = 0.0, tt_ss_im = 0.0;
+                float  tt_max_row = 0.0f;
+                int64_t tt_bad_rows = 0;
+                std::vector<float> tt_dq;
+                const bool tt_on = tt_of.is_open() && ggml_is_quantized(new_type);
+
                 const int64_t n_per_row = tensor->ne[0];
                 const int64_t nrows_per_expert = tensor->ne[1];
                 const int64_t nrows_total = tensor->ne[1] * tensor->ne[2];
@@ -1437,10 +1610,34 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     const int64_t nchunk = (nelements_cur + chunk_size - 1)/chunk_size;
                     const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
-                    const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, workers, nthread_use);
+                    // GPTQ/OBS: load U factor for MXFP4 tensors when enabled
+                    // (U depends only on K = n_per_row, safe to reload per slab; in practice one slab covers the tensor)
+                    const float * gptq_U_ptr  = nullptr;
+                    const float * gptq_udiag_ptr = nullptr;
+                    if (!qs.gptq_u_dir.empty() && new_type == GGML_TYPE_MXFP4) {
+                        if (qs.load_gptq_u(tensor->name, n_per_row)) {
+                            gptq_U_ptr = qs.gptq_U.data();
+                            gptq_udiag_ptr = qs.gptq_udiag.data();
+                        }
+                    }
+
+                    const size_t size_cur = llama_tensor_quantize_impl(new_type, f32_data, work.data(), chunk_size, ir, nrows_cur, nrows_per_expert, n_per_row, imatrix, workers, nthread_use, gptq_U_ptr, gptq_udiag_ptr);
 
                     fout.write((const char *) work.data(), size_cur);
                     new_size += size_cur;
+
+                    if (tt_on) {
+                        llama_tensor_tt_measure(new_type, f32_data, work.data(), nrows_cur, n_per_row,
+                                                nrows_per_expert, ir, imatrix, tt_dq,
+                                                tt_sse, tt_ss, tt_sse_im, tt_ss_im, tt_max_row, tt_bad_rows);
+                    }
+                }
+                if (tt_on) {
+                    const double rmse   = tt_ss  > 0.0 ? std::sqrt(tt_sse/tt_ss)   : 0.0;
+                    const double im_rmse = tt_on && imatrix && tt_ss_im > 0.0 ? std::sqrt(tt_sse_im/tt_ss_im) : -1.0;
+                    tt_of << tensor->name << ',' << ggml_type_name(tensor->type) << ',' << ggml_type_name(new_type)
+                          << ',' << nrows_total << ',' << (nrows_total*n_per_row) << ',' << new_size
+                          << ',' << rmse << ',' << tt_max_row << ',' << tt_bad_rows << ',' << im_rmse << '\n';
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
             }
@@ -1462,6 +1659,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     if (!params->dry_run) {
         close_ofstream();
+    }
+
+    if (tt_of.is_open()) {
+        tt_of.close();
+        LLAMA_LOG_INFO("%s: wrote per-tensor errors to %s\n", __func__, params->tt_errors_file);
     }
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
@@ -1499,7 +1701,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
         /*.prune_layers                =*/ nullptr,
-        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE
+        /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE,
+        /*.tt_errors_file              =*/ nullptr
     };
 
     return result;

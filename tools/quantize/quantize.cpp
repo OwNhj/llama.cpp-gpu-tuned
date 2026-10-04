@@ -170,6 +170,8 @@ static void usage(const char * executable) {
     printf("  --dry-run\n");
     printf("                                      calculate and show the final quantization size without performing quantization\n");
     printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n");
+    printf("  --tt-errors file_name\n");
+    printf("                                      append per-tensor quantization error stats to file_name (CSV)\n");
     printf("  --max-buffer-size MiB\n");
     printf("                                      max amount of tensor rows kept in memory while quantizing one tensor (default: 8192)\n");
     printf("                                      lower it to quantize models with very large tensors on a machine with little RAM\n\n");
@@ -478,6 +480,18 @@ int llama_quantize(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
             params.keep_split = true;
+        } else if (strcmp(argv[arg_idx], "--tt-errors") == 0) {
+            if (arg_idx < argc-1) {
+                params.tt_errors_file = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--gptq-u-dir") == 0) {
+            if (arg_idx < argc-1) {
+                params.gptq_u_dir = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
         } else if (strcmp(argv[arg_idx], "--max-buffer-size") == 0) {
             if (arg_idx == argc-1) {
                 usage(argv[0]);
