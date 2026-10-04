@@ -323,6 +323,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate     = nullptr; // w1
     struct ggml_tensor * ffn_down     = nullptr; // w2
     struct ggml_tensor * ffn_up       = nullptr; // w3
+    struct ggml_tensor * ffn_gate_up  = nullptr; // fused [gate; up] rows
     struct ggml_tensor * ffn_gate_enc = nullptr;
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;
@@ -458,6 +459,7 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_s = nullptr;
     struct ggml_tensor * ffn_up_s   = nullptr;
     struct ggml_tensor * ffn_down_s = nullptr;
+    struct ggml_tensor * ffn_gate_up_s = nullptr;
     struct ggml_tensor * ffn_gate_shexp_s = nullptr;
     struct ggml_tensor * ffn_up_shexp_s   = nullptr;
     struct ggml_tensor * ffn_down_shexp_s = nullptr;

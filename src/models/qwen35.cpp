@@ -85,6 +85,11 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
             layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
         }
 
+        layer.ffn_gate_up = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP, "weight", il), {n_embd, 2*n_ff}, TENSOR_NOT_REQUIRED);
+        if (layer.ffn_gate_up) {
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
+            return;
+        }
         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
@@ -102,9 +107,14 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
 
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, mtp_flags);
+        layer.ffn_gate_up = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP, "weight", il), {n_embd, 2*n_ff}, TENSOR_NOT_REQUIRED);
+        if (!layer.ffn_gate_up) {
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, mtp_flags);
+        }
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, mtp_flags);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, mtp_flags);
+        if (!layer.ffn_gate_up) {
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, mtp_flags);
+        }
 
         // NextN-specific tensors that define the MTP block.
         layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", il), { 2 * n_embd, n_embd }, mtp_flags);
@@ -470,6 +480,24 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     // Qwen3.5 does not use MoE FFN
     GGML_ASSERT(model.layers[il].ffn_gate_inp == nullptr);
+
+    const auto & layer = model.layers[il];
+    if (layer.ffn_gate_up) {
+        // fused gate|up rows: one GEMM, then split rows for swiglu
+        const int64_t n_ff = layer.ffn_gate_up->ne[1] / 2;
+        ggml_tensor * gu = build_lora_mm(layer.ffn_gate_up, cur, layer.ffn_gate_up_s);
+        cb(gu, "ffn_gate_up_mm", il);
+        ggml_tensor * gate = ggml_view_2d(ctx0, gu, n_ff, gu->ne[1], gu->nb[1], 0);
+        ggml_tensor * up   = ggml_view_2d(ctx0, gu, n_ff, gu->ne[1], gu->nb[1],
+            ggml_row_size(gu->type, n_ff));
+        cb(gate, "ffn_gate", il);
+        cb(up, "ffn_up", il);
+        cur = ggml_swiglu_split(ctx0, gate, up);
+        cb(cur, "ffn_swiglu", il);
+        cur = build_lora_mm(layer.ffn_down, cur, layer.ffn_down_s);
+        cb(cur, "ffn_down", il);
+        return cur;
+    }
 
     cur = build_ffn(cur,
         model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
