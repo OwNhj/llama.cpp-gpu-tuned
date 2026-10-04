@@ -49,6 +49,14 @@ llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
     </tr>
 <table>
 
+## Calibration tooling in this fork
+
+This fork adds default-off offline quantization tooling: per-tensor quant error
+reporting (`llama-quantize --tt-errors`), Hessian collection
+(`llama-imatrix --hessian-dir`) and GPTQ-style requantization
+(`llama-quantize --gptq-u-dir`). See [CALIBRATION.md](CALIBRATION.md) for
+commands, corpus-shape notes and measured results.
+
 ## Description
 
 The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
