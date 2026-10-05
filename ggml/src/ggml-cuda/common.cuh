@@ -21,6 +21,32 @@
 #endif
 #endif
 #include "ggml-common.h"
+#include "../../rocmfp4/rocmfp4.h"
+#include "../../rocmfpx/rocmfpx.h"
+
+#ifndef GGML_ROCMI4_W4A4
+#define GGML_ROCMI4_W4A4 0
+#endif
+
+#ifndef GGML_ROCMFP6_EXPANDED_DEVICE
+#define GGML_ROCMFP6_EXPANDED_DEVICE 0
+#endif
+
+// Optional device-only ROCmFP6 layout. GGUF/CPU storage remains the packed
+// block_rocmfp6 layout; experimental ROCm builds may expand qs to signed
+// bytes to avoid bit unpacking in hot matmul/FA kernels.
+struct block_rocmfp6_expanded {
+    int8_t  qs[QK_ROCMFP6];
+    uint8_t e[2];
+};
+
+static_assert(sizeof(block_rocmfp6_expanded) == QK_ROCMFP6 + 2*sizeof(uint8_t), "wrong expanded rocmfp6 block size/padding");
+
+#if GGML_ROCMFP6_EXPANDED_DEVICE
+using block_rocmfp6_device = block_rocmfp6_expanded;
+#else
+using block_rocmfp6_device = block_rocmfp6;
+#endif
 
 #include <array>
 #include <algorithm>
@@ -131,15 +157,15 @@ static __device__ __forceinline__ void ggml_cuda_syncwarp() {
 }
 
 static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
-#if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+#if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     cudaGridDependencySynchronize();
-#endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+#endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
 static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
-#if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+#if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     cudaTriggerProgrammaticLaunchCompletion();
-#endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+#endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
 #ifdef __CUDA_ARCH_LIST__
@@ -285,21 +311,21 @@ static const char * cu_get_error_str(CUresult err) {
 #define VOLTA_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
 
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
 #define TURING_MMA_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
 
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define AMPERE_MMA_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
 #    define BLACKWELL_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
 
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define CP_ASYNC_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 
 #if !defined(GGML_CUDA_NO_FA) && !(defined(GGML_USE_MUSA) && __MUSA_ARCH__ < 220)
 #define FLASH_ATTN_AVAILABLE
@@ -453,7 +479,7 @@ struct ggml_cuda_unroll<1> {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
     return __reduce_add_sync(0xffffffff, x);
 #else
 #pragma unroll
@@ -461,7 +487,7 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 }
 
 template<int width = WARP_SIZE>
@@ -885,6 +911,242 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
+// Raw UE4M3 -> f32, WITHOUT the /2 baked into ggml_cuda_ue4m3_to_fp32 (that /2 compensates the
+// 2x-doubled e2m1 int8 lookup table used by the dp4a / int8-WMMA paths). The fp8 WMMA paths
+// store exact e2m1 values as e4m3, so the scale must be applied raw.
+static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32_raw(uint8_t x) {
+#if defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
+    const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
+    const __hip_fp8_e4m3_fnuz xf = *reinterpret_cast<const __hip_fp8_e4m3_fnuz *>(&bits);
+    return static_cast<float>(xf);
+#else
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+    const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
+    const __nv_fp8_e4m3 xf = *reinterpret_cast<const __nv_fp8_e4m3 *>(&bits);
+    return static_cast<float>(xf);
+#else
+    if (x == 0 || (x == 0x7F && x != 0xFF)) { // Convert NaN to 0.0f
+        return 0.0f;
+    }
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    if (exp == 0) {
+        return ldexpf((float) man, -9);
+    }
+    return ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+#endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
+}
+
+// Same value as ggml_cuda_ue4m3_to_fp32_raw, built with bit manipulation instead of ldexpf.
+// On RDNA4/HIP the branches above both miss, so the raw helper falls back to software ldexpf,
+// and the fp8 WMMA weight-tile loader calls it once per 32-element block. E8M0 (what MXFP4
+// uses) decodes with a single shift, so that cost showed up as a ~10% prefill regression for
+// MXFP4_E4M3. Identical for every input in 0x00..0x7E, i.e. every code a UE4M3 scale can
+// legally hold; 0x7F is NaN and decodes to a finite value here, as it also does in the raw
+// helper's fast branches.
+// Same value as ggml_cuda_ue4m3_to_fp32_raw, without ldexpf and without a branch.
+//
+// On RDNA4/HIP both hardware branches of the raw helper miss, so it falls back to software
+// ldexpf, and the fp8 WMMA weight loader calls it once per 32-element block. E8M0 (MXFP4's
+// scale) decodes with a single shift, so that showed up as a measurable prefill cost.
+//
+// The select is deliberate: an if/else on exp == 0 is data dependent (many blocks sit in the
+// subnormal range and many do not), so it diverges and both sides end up executing. Measured
+// pp512 on Qwen3.8-27B: 1375 with the branch against 1500 branchless, which is the same as
+// MXFP4's. Exact for every code in 0x00..0x7E, i.e. every legal UE4M3 scale; 0x7F is NaN.
+static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32_raw_fast(uint8_t x) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    // RDNA4 (gfx1200/gfx1201) OCP e4m3 -> f32: __builtin_amdgcn_cvt_f32_fp8.
+    // No 0x7F guard: the ue4m3 scale quantizer never emits that code (it clamps candidates to
+    // 0x01..0x7E, see quantize_row_mxfp4_e4m3_impl), so it cannot occur in a legal file.
+    // Verified bit-identical to the software path for every code in 0x00..0x7E.
+    return __builtin_amdgcn_cvt_f32_fp8((uint32_t) x, 0);
+#else
+    const uint32_t exp = (x >> 3) & 0xF;
+    const uint32_t man = x & 0x7;
+    // normal: (1 + man/8) * 2^(exp-7); +127 for the f32 bias, man lands at bit 20
+    const uint32_t nb = (exp + 120u) << 23 | man << 20;
+    float nrm;
+    memcpy(&nrm, &nb, sizeof(float));
+    const float sub = (float) man * (1.0f / 512.0f); // subnormal: man * 2^-9, exact
+    return exp == 0 ? sub : nrm;
+#endif // defined(GGML_USE_HIP) && defined(RDNA4)
+}
+
+// Signed e4m3 -> f32: the decode convention the F8 KV cache is written with, matching
+// dequantize_f8() in dequantize.cuh. Note the sign bit has to be handled separately here, because
+// ggml_cuda_ue4m3_to_fp32_raw() decodes the unsigned "ue4m3" variant and ignores bit 7.
+static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32_signed(const uint8_t b) {
+    return (b & 0x80 ? -1.0f : 1.0f) * ggml_cuda_ue4m3_to_fp32_raw(b & 0x7F);
+}
+
+// e4m3 -> f16 as a pure integer bit manipulation, with no f32 intermediate.
+//
+// e4m3 and f16 are both sign/exponent/mantissa formats, so shifting the 7 non-sign bits of the
+// e4m3 code left by 7 lines the 4-bit exponent and 3-bit mantissa up against f16's 5-bit exponent
+// and 10-bit mantissa, and adding 1 << 13 re-biases the exponent from e4m3's 7 to f16's 15. For
+// every one of the 254 finite e4m3 codes this is exact. It is used instead of decoding to f32 and
+// narrowing because f32 lanes cost twice the register space of the 16-bit lanes actually needed,
+// and gfx12 has no direct e4m3x2 -> f16x2 instruction (that one requires gfx1250).
+//
+// e4m3 subnormals (exponent field 0, magnitude < 2^-6) do not map onto an f16 exponent field of 0,
+// but they are comfortably normal in f16 (whose own subnormal range starts at 2^-24), so they are
+// renormalized explicitly. e4m3 has no infinity; the two NaN codes map to 0 as elsewhere in ggml.
+static __device__ __forceinline__ uint16_t ggml_cuda_e4m3_to_f16_bits(const uint8_t b) {
+    const uint16_t sign = (uint16_t) ((b >> 7) & 1u) << 15;
+    const uint8_t  e    = (b >> 3) & 0x0Fu;
+    const uint8_t  m    = b & 0x07u;
+
+    if (e != 0) {
+        if (e == 0x0Fu && m == 0x07u) {
+            return 0;   // NaN -> 0, matching the ggml convention
+        }
+        return (uint16_t) (sign | ((((uint16_t) (b & 0x7Fu) << 7) + 0x2000u) & 0x7FFFu));
+    }
+    if (m == 0) {
+        return sign;    // +-0
+    }
+    int p = 2;
+    while (((m >> p) & 1u) == 0u) {
+        --p;
+    }
+    const uint16_t frac = (uint16_t) (m & ((1u << p) - 1u));
+    const int      ex   = -9 + p + 15;
+    return (uint16_t) (sign | ((uint16_t) ex << 10) | (uint16_t) (frac << (10 - p)));
+}
+
+// Two e4m3 codes packed into one half2 (lane 0 = b0).
+//
+// On gfx12 this goes through the hardware e4m3x2 -> f32x2 conversion followed by a narrowing pack:
+// both are single instructions, giving a branch-free sequence. The integer path below needs an
+// exponent test plus a subnormal renormalization loop per element, which is worse where this runs
+// once per element (the vector attention kernel's Q.K dot product).
+// The two agree bit-for-bit on all 254 finite e4m3 codes; they differ only for the two NaN codes,
+// which the KV cache never contains (the quantizer scales by amax/448, so every value is finite).
+//
+// Declared after ggml_cuda_e4m3x2_to_fp32 so the hardware path can use it.
+static __device__ __forceinline__ half2 ggml_cuda_e4m3x2_to_half2(const uint8_t b0, const uint8_t b1);
+
+// Decode TWO independent SIGNED e4m3 bytes to f32 with a single hardware instruction on gfx12
+// (v_cvt_pk_f32_fp8). The two bytes need not be adjacent in memory. On other architectures this
+// falls back to the portable software decode.
+//
+// Note this is NOT the same as ggml_cuda_ue4m3_to_fp32_raw(): that helper decodes the UNSIGNED
+// ue4m3 variant and ignores bit 7, so it must not be fed a signed e4m3 byte as-is.
+static __device__ __forceinline__ float2 ggml_cuda_e4m3x2_to_fp32(uint8_t b0, uint8_t b1) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    using f32x2_t = __attribute__((ext_vector_type(2))) float;
+    const uint32_t packed = (uint32_t) b0 | ((uint32_t) b1 << 8);
+    const f32x2_t v = __builtin_amdgcn_cvt_pk_f32_fp8(packed, false);
+    return make_float2(v[0], v[1]);
+#else
+    const int s0 = (b0 >> 7) & 0x1, e0 = (b0 >> 3) & 0xF, m0 = b0 & 0x7;
+    const int s1 = (b1 >> 7) & 0x1, e1 = (b1 >> 3) & 0xF, m1 = b1 & 0x7;
+    const float v0 = (e0 == 0xF && m0 == 0x7) ? 0.0f : ldexpf(1.0f + (float) m0*(1.0f/8.0f), e0 - 7);
+    const float v1 = (e1 == 0xF && m1 == 0x7) ? 0.0f : ldexpf(1.0f + (float) m1*(1.0f/8.0f), e1 - 7);
+    return make_float2(s0 ? -v0 : v0, s1 ? -v1 : v1);
+#endif
+}
+
+static __device__ __forceinline__ half2 ggml_cuda_e4m3x2_to_half2(const uint8_t b0, const uint8_t b1) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    const float2 v = ggml_cuda_e4m3x2_to_fp32(b0, b1);
+    return __floats2half2_rn(v.x, v.y);
+#else
+    const uint32_t packed = (uint32_t) ggml_cuda_e4m3_to_f16_bits(b0) |
+                            ((uint32_t) ggml_cuda_e4m3_to_f16_bits(b1) << 16);
+    half2 h;
+    memcpy(&h, &packed, sizeof(h));
+    return h;
+#endif
+}
+
+// The 16 e2m1 codes (sign | e<<1 | m) in their exact e4m3 encoding. A single 16-byte table carries
+// sign, exponent and mantissa at once, turning the per-nibble conversion into one byte lookup --
+// the previous branch-on-exponent form cost several shifts, masks and a divergent select per
+// nibble, which dominated the MXFP4 fp8 tile loader (see design.md 4.7.3f).
+__device__ __constant__ uint8_t ggml_cuda_e2m1_to_e4m3_lut[16] = {
+    0x00, 0x30, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C,   // +0, +0.5, +1, +1.5, +2, +3, +4, +6
+    0x80, 0xB0, 0xB8, 0xBC, 0xC0, 0xC4, 0xC8, 0xCC,   // the same magnitudes, negated
+};
+
+// Exact e2m1 (OCP FP4, 4-bit) -> e4m3 (FP8, 8-bit) expansion.
+// The 8 e2m1 magnitudes {0, 0.5, 1, 1.5, 2, 3, 4, 6} are all exactly representable in e4m3
+// (mantissas 1.0 / 1.5, wide enough exponent range), so MXFP4 / NVFP4 weights can be fed to the
+// W8A8 fp8 WMMA path with zero extra loss. `c` is the 4-bit e2m1 code (sign | e<<1 | m).
+// NOTE: CPU dequant pairs kvalues_fp4 (2x e2m1) with a half scale (ggml_e8m0_to_fp32_half /
+// ggml_ue4m3_to_fp32 = value*0.5) so the net value is the standard e2m1 * scale; emitting raw
+// e2m1 here (raw scale on the GPU) is consistent with that.
+static __device__ __forceinline__ uint8_t ggml_cuda_e2m1_to_e4m3(uint8_t c) {
+    return ggml_cuda_e2m1_to_e4m3_lut[c & 0xF];
+}
+
+// E4M3FN (OCP) saturating round-to-nearest-even f32 -> e4m3 encoder.
+// Global (non-static) so the KV-cache quantize (set-rows / cpy-utils) and the
+// F8 flash-attention kernel can cast f16/f32 values to e4m3 without a dequant.
+__device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e4m3(float v) {
+    const uint32_t bits = __float_as_uint(v);
+    if (bits == 0u || (bits & 0x7F800000u) >= 0x7F800000u) {
+        return 0; // zero, or NaN/Inf
+    }
+
+    const uint8_t s = v < 0.0f ? 0x80u : 0x00u;
+    v = fabsf(v);
+
+    if (v >= 448.0f) {
+        return s | 0x7Eu; // saturate to max finite
+    }
+
+    if (v < (1.0f / 64.0f)) {
+        // denormal region: value = m * 2^-9, m in [0, 8); m == 8 carries into e == 1
+        const float t = v * 512.0f + 0.5f;
+        uint32_t m = (uint32_t) t;
+        if (t == (float) m && (m & 1u)) {
+            m--; // round ties to even
+        }
+        if (m >= 8u) {
+            return s | 0x08u;
+        }
+        return s | (uint8_t) m;
+    }
+
+    // normal region: v = (1 + m/8) * 2^(e - 7)
+    int E;
+    const float f = frexpf(v, &E); // v = f * 2^E, f in [0.5, 1)
+    int e = E + 6;
+    const float frac = (2.0f * f - 1.0f) * 8.0f; // in [0, 8)
+    const float t = frac + 0.5f;
+    uint32_t m = (uint32_t) t;
+    if (t == (float) m && (m & 1u)) {
+        m--; // round ties to even
+    }
+    if (m >= 8u) {
+        m = 0;
+        e++;
+    }
+    if (e > 15) {
+        return s | 0x7Eu;
+    }
+    return s | (uint8_t) (e << 3) | (uint8_t) m;
+}
+// Encode TWO f32 values to two packed e4m3 bytes with one hardware instruction on gfx12
+// (v_cvt_pk_fp8_f32). Low byte = `a`, second byte = `b`.
+//
+// Exists because the scalar software encoder above costs a frexpf plus several rounding branches
+// per element, which made the F8 KV-cache write about 6x slower than the Q8_0 one (that one only
+// needs a roundf). The two were verified to agree on 1M sampled values across the range the
+// quantizer actually produces (|x| <= 448 after scaling by 448/amax).
+static __device__ __forceinline__ uint16_t ggml_cuda_fp32x2_to_e4m3x2(float a, float b) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    const uint32_t packed = __builtin_amdgcn_cvt_pk_fp8_f32(a, b, 0u, false);
+    return (uint16_t) (packed & 0xFFFFu);
+#else
+    return (uint16_t) ((uint32_t) ggml_cuda_fp32_to_e4m3(a) | ((uint32_t) ggml_cuda_fp32_to_e4m3(b) << 8));
+#endif
+}
+
+
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
     const uint8_t sign_bit = (x < 0.0f) << 3;
     float         ax       = fabsf(x) * e;
@@ -1049,6 +1311,57 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
     static constexpr int qr = QR_NVFP4;
     static constexpr int qi = QI_NVFP4;
     static constexpr int bs = sizeof(block_nvfp4);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP8> {
+    static constexpr int qk = QK_MXFP8;
+    static constexpr int qr = QR_MXFP8;
+    static constexpr int qi = QI_MXFP8;
+    static constexpr int bs = sizeof(block_mxfp8);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP6> {
+    static constexpr int qk = QK_MXFP6;
+    static constexpr int qr = QR_MXFP6;
+    static constexpr int qi = QI_MXFP6;
+    static constexpr int bs = sizeof(block_mxfp6);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP4_E4M3> {
+    static constexpr int qk = QK_MXFP4_E4M3;
+    static constexpr int qr = QR_MXFP4_E4M3;
+    static constexpr int qi = QI_MXFP4_E4M3;
+    static constexpr int bs = sizeof(block_mxfp4_e4m3);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_F8> {
+    static constexpr int qk = QK_F8;
+    static constexpr int qr = QR_F8;
+    static constexpr int qi = QI_F8;
+    static constexpr int bs = sizeof(block_f8);
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_ROCMI4> {
+    static constexpr int qk = QK_ROCMI4;
+    static constexpr int qr = QR_ROCMI4;
+    static constexpr int qi = QI_ROCMI4;
+};
+
+// Q4_0_SYM4 shares Q4_0_ROCMI4's block layout, so it reuses ROCMI4's int8 kernels.
+// The grid offset is folded away in the loaders: (n + 0.5)*s == (2n + 1)*(s/2), and
+// 2n+1 lies in [-15, 15], which still fits an int8 tile element. So the loaders emit
+// 2n+1 and halve the scale, and ROCMI4's vec_dot applies unchanged -- no epilogue term.
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_0_SYM4> {
+    static constexpr int qk = QK_ROCMI4;
+    static constexpr int qr = QR_ROCMI4;
+    static constexpr int qi = QI_ROCMI4;
+    static constexpr int bs = sizeof(block_sym4);
 };
 
 template<>
@@ -1571,6 +1884,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    const ggml_tensor * shared_up = nullptr;
+    const ggml_tensor * shared_gate = nullptr;
+    ggml_tensor * shared_dst = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1580,6 +1896,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    const void * shared_up = nullptr;
+    const void * shared_gate = nullptr;
+    float * shared_dst = nullptr;
+    uint32_t shared_stride_col_dst = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {
@@ -1680,11 +2000,11 @@ static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
 #endif //defined(GGML_CUDA_USE_PDL)
 
 // PDL and __restrict__ need to be mutually exclusive, see https://github.com/ggml-org/llama.cpp/pull/24030
-# if (defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
+# if (defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER)
 # define GGML_CUDA_RESTRICT
 # else
 # define GGML_CUDA_RESTRICT __restrict__
-# endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+# endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 
 template<typename Kernel, typename... Args>
 static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {

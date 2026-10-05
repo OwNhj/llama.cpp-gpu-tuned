@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "../../rocmfp4/rocmfp4_hip_codebook.cuh"
 
 #include <cstdint>
 
@@ -307,6 +308,13 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_0_16_q8_1_
 #define VDR_MXFP4_Q8_1_MMVQ 2
 #define VDR_MXFP4_Q8_1_MMQ  4
 
+// ROCMI4 is the only ROCmFPx-family type kept; its VDR values are inlined.
+#define VDR_ROCMI4_Q8_1_MMVQ 2
+#define VDR_ROCMI4_Q8_1_MMQ  8
+// Preserved from experimental branch: our FP6 MMVQ optimizations.
+
+
+
 static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -326,6 +334,70 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 
     const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
     return d * sumi;
+}
+
+#define VDR_NVFP4_Q8_1_MMVQ 4
+#define VDR_NVFP4_Q8_1_MMQ  8
+
+// NOTE: the ROCmFPX FP2/FP3/FP6 vec_dot helpers that used to live here were removed:
+// three of them (rocmfpx_decode_fp6_code_vec_cuda, rocmfpx_pack4_fp6_vec_cuda,
+// rocmfpx_pack4_fp6_device_vec_cuda) had empty non-void bodies (undefined behavior), and the
+// whole group had no call sites left after the ROCMFP family was dropped.
+
+static __device__ __forceinline__ int2 rocmi4_unpack_signed_nibbles(const int q4) {
+    int even = q4 & 0x0F0F0F0F;
+    int odd  = (q4 >> 4) & 0x0F0F0F0F;
+    const int se = even & 0x08080808;
+    const int so = odd  & 0x08080808;
+    even |= (se << 1) | (se << 2) | (se << 3) | (se << 4);
+    odd  |= (so << 1) | (so << 2) | (so << 3) | (so << 4);
+    return make_int2(even, odd);
+}
+
+static __device__ __forceinline__ float vec_dot_rocmi4_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_rocmi4 * bq4 = (const block_rocmi4 *) vbq + kbx;
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_ROCMI4_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
+        const int2 v = rocmi4_unpack_signed_nibbles(aux_q4);
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+
+    return __low2float(bq8_1->ds) * rocmfpx_ue4m3_to_fp32_finite(bq4->e) * sumi;
+}
+
+// Q4_0_SYM4 (MMVQ / decode). Same 17-byte block and nibble order as ROCMI4, but the nibble
+// means (n + 0.5)*e. MMVQ uses dp4a, whose operands are full int8, so the grid offset folds
+// into the data exactly as it does in the MMQ W8A8 loader:
+//     (n + 0.5)*e == (2n + 1)*(e/2),   2n+1 in [-15, 15]
+// No epilogue correction is needed on this path. (The W4A4 iu4 MMA cannot use this trick --
+// it reads the LDS row as packed 4-bit nibbles -- so that path corrects in the epilogue.)
+#define VDR_SYM4_Q8_1_MMVQ 2
+#define VDR_SYM4_Q8_1_MMQ  8
+
+static __device__ __forceinline__ float vec_dot_sym4_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_sym4 * bq4 = (const block_sym4 *) vbq + kbx;
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_SYM4_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = rocmfp4_get_qs_i32(bq4->qs, iqs + l);
+        const int2 v = rocmfp4_sym4_shift_offset(rocmi4_unpack_signed_nibbles(aux_q4));
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+
+    // The 0.5 factor is the other half of the (2n+1)*(e/2) identity.
+    return __low2float(bq8_1->ds) * 0.5f * rocmfpx_ue4m3_to_fp32_finite(bq4->e) * sumi;
 }
 
 #define VDR_NVFP4_Q8_1_MMVQ 4
@@ -360,6 +432,157 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 
     return sum;
 }
+
+#define VDR_MXFP8_Q8_1_MMVQ 2
+#define VDR_MXFP8_Q8_1_MMQ  1
+
+#define VDR_MXFP6_Q8_1_MMVQ 2
+#define VDR_MXFP6_Q8_1_MMQ  1
+
+#define VDR_MXFP4_E4M3_Q8_1_MMVQ 2
+#define VDR_MXFP4_E4M3_Q8_1_MMQ  1
+
+// MXFP4_E4M3: same packed E2M1 nibbles and work-item mapping as MXFP4, only the block scale
+// differs (UE4M3 instead of E8M0). kvalues_mxfp4 stores 2x the e2m1 value, so the scale is
+// halved the same way MXFP4 does it.
+static __device__ __forceinline__ float vec_dot_mxfp4_e4m3_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp4_e4m3 * bq4 = (const block_mxfp4_e4m3 *) vbq + kbx;
+
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP4_E4M3_Q8_1_MMVQ; ++l) {
+        const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+
+    const float d = ggml_cuda_ue4m3_to_fp32_raw_fast(bq4->e) * 0.5f * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
+using ggml_cuda_vfloat2 = __attribute__((ext_vector_type(2))) float;
+
+// Four packed E2M3 codes (3 bytes) -> 4 int8 magnitudes in one int. The table stores
+// value*8, which fits int8, so dp4a can consume the result directly.
+static __device__ __forceinline__ int ggml_cuda_mxfp6_unpack4(const void * __restrict__ x) {
+    const uint8_t * x8 = (const uint8_t *) x;
+
+    const uint32_t w = (uint32_t) x8[0] | ((uint32_t) x8[1] << 8) | ((uint32_t) x8[2] << 16);
+
+    const int v0 = kvalues_mxfp6_e2m3[ w        & 0x3F];
+    const int v1 = kvalues_mxfp6_e2m3[(w >>  6) & 0x3F];
+    const int v2 = kvalues_mxfp6_e2m3[(w >> 12) & 0x3F];
+    const int v3 = kvalues_mxfp6_e2m3[(w >> 18) & 0x3F];
+
+    return (v0 & 0xFF) | ((v1 & 0xFF) << 8) | ((v2 & 0xFF) << 16) | ((v3 & 0xFF) << 24);
+}
+
+// MXFP6 uses MXFP8's work item mapping (QR = 1, so QI = 64 and vdr = 2): thread step iqs
+// covers elements [4*iqs, 4*iqs+8). 4*iqs is a multiple of 8, so the 8 codes lie in one
+// 6-byte group (8 codes x 6 bits) of the 32-element sub-block.
+static __device__ __forceinline__ float vec_dot_mxfp6_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp6 * bx = (const block_mxfp6 *) vbq + kbx;
+    const block_q8_1 * by = bq8_1 + iqs / 8;
+
+    const int sub = iqs / 8;             // sub-block holding the E8M0 scale
+    const int grp = (iqs % 8) / 2;       // which 6-byte group of 8 codes
+
+    const uint8_t * qs = bx->qs[sub] + 6*grp;
+
+    const int x0 = ggml_cuda_mxfp6_unpack4(qs);
+    const int x1 = ggml_cuda_mxfp6_unpack4(qs + 3);
+
+    const int * qy = (const int *) by->qs + (iqs % 8);
+    int sumi = 0;
+    sumi = ggml_cuda_dp4a(x0, qy[0], sumi);
+    sumi = ggml_cuda_dp4a(x1, qy[1], sumi);
+
+    const float dx = ggml_cuda_e8m0_to_fp32(bx->e[sub]) * (1.0f / 8.0f);
+    const float dy = __low2float(by->ds);
+
+    return dx * dy * (float) sumi;
+}
+
+
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+// hardware: 2 packed E4M3 (bytes 0,1 of v) -> vfloat2 (gfx12; gfx1250 has the faster v_cvt_f16_fp8)
+static __device__ __forceinline__ ggml_cuda_vfloat2 ggml_cuda_cvt_e4m3x2(uint32_t v) {
+    return __builtin_amdgcn_cvt_pk_f32_fp8(v, false);
+}
+#else
+// portable E4M3 (OCP) decode; e == 15, m == 7 is NaN -> 0
+static __device__ __forceinline__ float ggml_cuda_e4m3_to_float(uint32_t b) {
+    const uint32_t s = b & 0x80;
+    const uint32_t e = (b >> 3) & 0xF;
+    uint32_t m = b & 0x7;
+
+    uint32_t bits;
+    if (e == 0) {
+        if (m == 0) {
+            return 0.0f;
+        }
+        // denormal: m * 2^-9
+        uint32_t a = 0;
+        while ((m & 1) == 0) {
+            m >>= 1;
+            a++;
+        }
+        bits = (s << 24) | ((118 + a) << 23) | ((m - 1) << (23 - a));
+    } else if (e == 15 && m == 7) {
+        return 0.0f; // NaN
+    } else {
+        // normal: (1 + m/8) * 2^(e-7)
+        bits = (s << 24) | ((120 + e) << 23) | (m << 20);
+    }
+
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+static __device__ __forceinline__ ggml_cuda_vfloat2 ggml_cuda_cvt_e4m3x2(uint32_t v) {
+    return ggml_cuda_vfloat2{ggml_cuda_e4m3_to_float(v & 0xFF), ggml_cuda_e4m3_to_float((v >> 8) & 0xFF)};
+}
+#endif // defined(GGML_USE_HIP) && defined(RDNA4)
+
+// x block_mxfp8 (QK=256, 8 e8m0 scales of 32) vs y block_q8_1 (QK=32).
+// one x block spans 8 y blocks; each thread (vdr ints = 8 x elements) stays inside a
+// single 32-element sub-block, so a single e8m0 scale applies to the whole thread chunk.
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp8 * bx = (const block_mxfp8 *) vbq + kbx;
+    const block_q8_1 * by = bq8_1 + iqs / 8;
+
+    const int * qx = (const int *) bx->qs + iqs;
+    const int * qy = (const int *) by->qs + (iqs % 8);
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP8_Q8_1_MMVQ; ++l) {
+        const ggml_cuda_vfloat2 x01 = ggml_cuda_cvt_e4m3x2(qx[l]);
+        const ggml_cuda_vfloat2 x23 = ggml_cuda_cvt_e4m3x2(qx[l] >> 16);
+
+        sum += x01[0] * (float) (int8_t) (qy[l] & 0xFF);
+        sum += x01[1] * (float) (int8_t) ((qy[l] >> 8) & 0xFF);
+        sum += x23[0] * (float) (int8_t) ((qy[l] >> 16) & 0xFF);
+        sum += x23[1] * (float) (int8_t) ((qy[l] >> 24) & 0xFF);
+    }
+
+    const float dx = ggml_cuda_e8m0_to_fp32(bx->e[iqs / 8]);
+    const float dy = __low2float(by->ds);
+
+    return dx * dy * sum;
+}
+
 #define VDR_Q2_K_Q8_1_MMVQ 1
 #define VDR_Q2_K_Q8_1_MMQ  4
 
@@ -471,7 +694,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> i) << 2) & 0x04040404;
 
-        const int vi = __vsubss4(vil, vih);
+        const int vi = __vsub4(vil, vih);
 
         sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
@@ -638,7 +861,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
-        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+        const int vi = __vsub4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
 
         sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }

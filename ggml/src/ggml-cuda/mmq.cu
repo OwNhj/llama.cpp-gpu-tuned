@@ -70,6 +70,13 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, args, stream);
             break;
 // -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
+        case GGML_TYPE_Q4_0_ROCMI4:
+            mul_mat_q_case<GGML_TYPE_Q4_0_ROCMI4>(ctx, args, stream);
+            break;
+        case GGML_TYPE_Q4_0_SYM4:
+            mul_mat_q_case<GGML_TYPE_Q4_0_SYM4>(ctx, args, stream);
+            break;
         case GGML_TYPE_MXFP4:
             // src1 at Q4 uses the native FP4 instructions, which are Blackwell-only
             if (prec_src1 == GGML_PREC_Q4) {
@@ -84,6 +91,15 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
                 break;
             }
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
+            break;
+        case GGML_TYPE_MXFP8:
+            mul_mat_q_case<GGML_TYPE_MXFP8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_MXFP6:
+            mul_mat_q_case<GGML_TYPE_MXFP6>(ctx, args, stream);
+            break;
+        case GGML_TYPE_MXFP4_E4M3:
+            mul_mat_q_case<GGML_TYPE_MXFP4_E4M3>(ctx, args, stream);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -204,6 +220,14 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
+            } else if ((src0->type == GGML_TYPE_MXFP8 || src0->type == GGML_TYPE_MXFP6 || src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_MXFP4_E4M3)
+                       && GGML_CUDA_CC_IS_RDNA4(cc)) {
+                // e4m3 y tiles for the W8A8 fp8 WMMA path (RDNA4 only). NVFP4 is deliberately
+                // NOT here: its MMQ vec_dot is the mainline int8 one (q8_0_16), which consumes
+                // q8_1 int8 y. Producing e4m3 y while running an int8 vec_dot feeds int8 code
+                // e4m3 bytes and corrupts the result, so the two choices have to move together.
+                quantize_mmq_mxfp8_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                       ne11, ne12, ne13, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -255,7 +279,7 @@ void ggml_cuda_mul_mat_q(
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -280,6 +304,19 @@ void ggml_cuda_mul_mat_q(
             } else {
                 quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+            }
+        } else if ((src0->type == GGML_TYPE_MXFP8 || src0->type == GGML_TYPE_MXFP6 || src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_MXFP4_E4M3)
+                   && GGML_CUDA_CC_IS_RDNA4(cc)) {
+            // e4m3 y tiles for the W8A8 fp8 WMMA path (RDNA4 only); other archs fall through
+            // to the q8_1 int8 y consumed by the mainline int8 vec_dots. NVFP4 is excluded here
+            // for the same reason as in ggml_cuda_mul_mat_q: its MMQ vec_dot is the int8 one
+            // (q8_0_16), so e4m3 y would be read as int8 code and corrupt the result.
+            if (dedup_bcast) {
+                quantize_scatter_mmq_mxfp8_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
+                                        /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+            } else {
+                quantize_mmq_mxfp8_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                       ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
@@ -348,11 +385,21 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
+        case GGML_TYPE_MXFP8:
+        case GGML_TYPE_MXFP6:
+        case GGML_TYPE_MXFP4_E4M3:
+        case GGML_TYPE_Q4_0_ROCMI4:
+        case GGML_TYPE_Q4_0_SYM4:
             mmq_supported = true;
             break;
         default:
             mmq_supported = false;
             break;
+    }
+
+    // The MXFP8/MXFP6 W8A8 fp8 WMMA path is implemented for RDNA4 only.
+    if ((type == GGML_TYPE_MXFP8 || type == GGML_TYPE_MXFP6 || type == GGML_TYPE_MXFP4_E4M3) && !GGML_CUDA_CC_IS_RDNA4(cc)) {
+        return false;
     }
 
     if (!mmq_supported) {

@@ -36,7 +36,11 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q2_0",     LLAMA_FTYPE_MOSTLY_Q2_0,     " 2.25 bpw quantization (group 64)",  },
     { "Q4_0",     LLAMA_FTYPE_MOSTLY_Q4_0,     " 4.34G, +0.4685 ppl @ Llama-3-8B",  },
     { "Q4_1",     LLAMA_FTYPE_MOSTLY_Q4_1,     " 4.78G, +0.4511 ppl @ Llama-3-8B",  },
+    { "Q4_0_ROCMI4",           LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4,           " 4.25 bpw native signed-nibble 4-bit (no codebook)", },
+    { "Q4_0_SYM4",             LLAMA_FTYPE_MOSTLY_Q4_0_SYM4,             " 4.25 bpw symmetric 4-bit grid (n+0.5)*s, no exact zero", },
     { "MXFP4_MOE",LLAMA_FTYPE_MOSTLY_MXFP4_MOE," MXFP4 MoE",  },
+    { "MXFP4",    LLAMA_FTYPE_MOSTLY_MXFP4,    " 4.5 bpw MX FP4 (OCP, E2M1 + E8M0)", },
+    { "NVFP4",    LLAMA_FTYPE_MOSTLY_NVFP4,    " 4.25 bpw NV FP4 (OCP, E2M1 + UE4M3)", },
     { "Q5_0",     LLAMA_FTYPE_MOSTLY_Q5_0,     " 5.21G, +0.1316 ppl @ Llama-3-8B",  },
     { "Q5_1",     LLAMA_FTYPE_MOSTLY_Q5_1,     " 5.65G, +0.1062 ppl @ Llama-3-8B",  },
     { "IQ2_XXS",  LLAMA_FTYPE_MOSTLY_IQ2_XXS,  " 2.06 bpw quantization",            },
@@ -67,6 +71,10 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q5_K_M",   LLAMA_FTYPE_MOSTLY_Q5_K_M,   " 5.33G, +0.0569 ppl @ Llama-3-8B",  },
     { "Q6_K",     LLAMA_FTYPE_MOSTLY_Q6_K,     " 6.14G, +0.0217 ppl @ Llama-3-8B",  },
     { "Q8_0",     LLAMA_FTYPE_MOSTLY_Q8_0,     " 7.96G, +0.0026 ppl @ Llama-3-8B",  },
+    { "MXFP8",    LLAMA_FTYPE_MOSTLY_MXFP8,    " 8.25 bpw MX FP8 (OCP, E4M3 + E8M0)", },
+    { "MXFP6",    LLAMA_FTYPE_MOSTLY_MXFP6,    " 6.25 bpw MX FP6 (OCP, E2M3 + E8M0)", },
+    { "MXFP4_E4M3", LLAMA_FTYPE_MOSTLY_MXFP4_E4M3, " 4.25 bpw MX FP4 with a UE4M3 block scale", },
+    { "MXFP4_E4M3_MOE", LLAMA_FTYPE_MOSTLY_MXFP4_E4M3_MOE, "MXFP4_E4M3 with MXFP8 for the non-expert tensors", },
     { "F16",      LLAMA_FTYPE_MOSTLY_F16,      "14.00G, +0.0020 ppl @ Mistral-7B",  },
     { "BF16",     LLAMA_FTYPE_MOSTLY_BF16,     "14.00G, -0.0050 ppl @ Mistral-7B",  },
     { "F32",      LLAMA_FTYPE_ALL_F32,         "26.00G              @ 7B",          },
@@ -597,6 +605,9 @@ int llama_quantize(int argc, char ** argv) {
         arg_idx++;
         if (ftype_str == "COPY") {
             params.only_copy = true;
+        }
+        if (ftype_str == "Q4_0_ROCMFP4_EVEN" || ftype_str == "Q4_0_ROCMFP4_FAST_EVEN") {
+            params.pure = true;
         }
     } else {
         // argv[arg_idx] is not a valid ftype, so treat it as output path: <input> <output> <ftype>

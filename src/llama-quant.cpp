@@ -386,6 +386,24 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
     quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
 
+    // glm5-next
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        quantize &= name.find("hc_")                     == std::string::npos;
+        quantize &= name.find("indexer.attn_q_b")        == std::string::npos;
+        quantize &= name.find("indexer.attn_k")          == std::string::npos;
+        quantize &= name.find("indexer.proj")            == std::string::npos;
+        quantize &= name.find("indexer_compressor_gate") == std::string::npos;
+        quantize &= name.find("indexer_compressor_ape")  == std::string::npos;
+        quantize &= name.find("ssm_f_a.weight")          == std::string::npos;
+        quantize &= name.find("ssm_f_b.weight")          == std::string::npos;
+        quantize &= name.find("ssm_g_a.weight")          == std::string::npos;
+        quantize &= name.find("ssm_g_b.weight")          == std::string::npos;
+        quantize &= name.find("ssm_beta.weight")         == std::string::npos;
+        quantize &= name.find("attn_kv_a_mqa.weight")    == std::string::npos;
+        quantize &= name.find("attn_k_b.weight")         == std::string::npos;
+        quantize &= name.find("attn_v_b.weight")         == std::string::npos;
+    }
+
     // do not quantize RWKV's small yet 2D weights
     quantize &= name.find("time_mix_first.weight") == std::string::npos;
     quantize &= name.find("time_mix_w0.weight") == std::string::npos;
@@ -453,9 +471,16 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_TQ1_0:
             case GGML_TYPE_TQ2_0:   return_type = GGML_TYPE_Q4_0;   break;
+            case GGML_TYPE_Q4_0_ROCMI4: return_type = GGML_TYPE_Q4_0; break;
+            case GGML_TYPE_Q4_0_SYM4:   return_type = GGML_TYPE_Q4_0; break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_MXFP8:   return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_MXFP6:   return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_MXFP4_E4M3: return_type = GGML_TYPE_Q8_0; break;
+            case GGML_TYPE_MXFP4:   return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_NVFP4:   return_type = GGML_TYPE_Q8_0;   break;
             default:
                 if (qk_k <= 32) {
                     // the target is already a 32-block type, so there is no smaller block to demote to
@@ -482,9 +507,100 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
     return return_type;
 }
 
+// Defined further down; declared here so the mirror helpers below can use it.
+ggml_type llama_ftype_get_default_type(llama_ftype ftype);
+
+// MXFP4 / NVFP4 reuse Q4_0's per-tensor assignment, MXFP6 reuses Q6_K's and MXFP8 reuses Q8_0's,
+// mirroring whichever Q ftype has the closest bit width (4.25/4.5 bpw -> Q4_0 at 4.5, 6.25 -> Q6_K
+// at 6.5625, 8.25 -> Q8_0 at 8.5). Q6_K also matches MXFP6's 256-element block. Without this the
+// FP ftypes keep every tensor at their native width, leaving e.g. the output tensor un-promoted
+// where every other ftype promotes it to Q6_K.
+static llama_ftype fp_ftype_mirror(llama_ftype ftype) {
+    switch (ftype) {
+        case LLAMA_FTYPE_MOSTLY_MXFP4:
+        case LLAMA_FTYPE_MOSTLY_NVFP4:
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4:
+        case LLAMA_FTYPE_MOSTLY_Q4_0_SYM4:
+        case LLAMA_FTYPE_MOSTLY_MXFP4_E4M3:
+            return LLAMA_FTYPE_MOSTLY_Q4_0;
+        case LLAMA_FTYPE_MOSTLY_MXFP8:
+            return LLAMA_FTYPE_MOSTLY_Q8_0;
+        case LLAMA_FTYPE_MOSTLY_MXFP6:
+            return LLAMA_FTYPE_MOSTLY_Q6_K;
+        default:
+            return ftype;
+    }
+}
+
+// Map a type from the mirror decision back onto the FP format.
+// For the byte-coded formats the 6-bit and 8-bit slots of the mirrored Q rule are re-pointed at
+// MXFP6 and MXFP8, because MXFP4/NVFP4/MXFP6 have no Q counterpart above 5 bits to reuse. Anything
+// the Q rule reached for beyond that (F16, F32, ...) has no FP equivalent and is kept.
+static ggml_type fp_type_from_mirror(ggml_type t, ggml_type fp_type) {
+    const bool is_4bit_fp = fp_type == GGML_TYPE_MXFP4 || fp_type == GGML_TYPE_MXFP4_E4M3 ||
+                            fp_type == GGML_TYPE_NVFP4;
+
+    if (is_4bit_fp) {
+        switch (t) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+                return fp_type;
+            case GGML_TYPE_Q6_K: return GGML_TYPE_MXFP6;
+            case GGML_TYPE_Q8_0: return GGML_TYPE_MXFP8;
+            default:             return t;
+        }
+    }
+
+    switch (fp_type) {
+        case GGML_TYPE_MXFP6:
+            switch (t) {
+                case GGML_TYPE_Q6_K: return GGML_TYPE_MXFP6;
+                case GGML_TYPE_Q8_0: return GGML_TYPE_MXFP8;
+                default:             return t;
+            }
+        case GGML_TYPE_MXFP8:
+            return t == GGML_TYPE_Q8_0 ? GGML_TYPE_MXFP8 : t;
+        case GGML_TYPE_Q4_0_ROCMI4:
+        case GGML_TYPE_Q4_0_SYM4:
+            switch (t) {
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                    return fp_type;
+                default:
+                    return t;
+            }
+        default:
+            return t;
+    }
+}
+
 // internal standard logic for selecting the target tensor type based on tensor category, ftype, and model arch
 static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype, tensor_category category) {
     const std::string name = ggml_get_name(tensor);
+
+    // Reuse the Q4_0 / Q8_0 assignment for the FP ftypes, then translate the answer back. The
+    // mirror gets the mirror's own base type: the branches below compare new_type against Q types
+    // (e.g. "new_type != GGML_TYPE_Q8_0"), so passing the FP type would take the wrong side of
+    // those tests and promote tensors the Q path leaves alone.
+    const llama_ftype mirror = fp_ftype_mirror(ftype);
+    if (mirror != ftype) {
+        // The mirror runs with its own block size -- 32 for both Q4_0 and Q8_0, versus 256 for
+        // MXFP8 and 64 for NVFP4. Shape checks inside therefore pass on the mirror's granularity;
+        // tensor_type_fallback re-checks against the real target afterwards, so a shape that is
+        // incompatible with the FP type still lands on a valid one.
+        const ggml_type fp_type   = new_type;
+        const ggml_type mirror_ty = llama_ftype_get_default_type(mirror);
+        const ggml_type mirrored  = llama_tensor_get_type_impl(qs, mirror_ty, tensor, mirror, category);
+        return fp_type_from_mirror(mirrored, fp_type);
+    }
 
     // TODO: avoid hardcoded tensor names - use the TN_* constants
     const llm_arch arch = qs.model.arch;
@@ -509,6 +625,22 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         return std::make_pair(i_layer, n_layer);
     };
 
+    // by default, for glm5-next, don't let these tensors be quantized below Q8_0
+    if (arch == LLM_ARCH_GLM5_NEXT && (
+        name.find("attn_q_a")      != std::string::npos ||
+        name.find("attn_q_b")      != std::string::npos ||
+        name.find("nextn.eh_proj") != std::string::npos))
+    {
+        switch (new_type) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_BF16:
+            case GGML_TYPE_F16:
+                break;
+            default:
+                return GGML_TYPE_Q8_0;
+        }
+    }
+
     // for arches that share the same tensor between the token embeddings and the output, we quantize the token embeddings
     // with the quantization of the output tensor
     if (category == tensor_category::OUTPUT || (qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD)) {
@@ -518,8 +650,8 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             const int64_t nx = tensor->ne[0];
             const int64_t qk_k = ggml_blck_size(new_type);
 
-            if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
-                new_type = GGML_TYPE_Q8_0;
+            if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE || ftype == LLAMA_FTYPE_MOSTLY_MXFP4_E4M3_MOE) {
+                new_type = GGML_TYPE_MXFP8;
             }
             else if (arch == LLM_ARCH_FALCON || nx % qk_k != 0) {
                 new_type = GGML_TYPE_Q8_0;
@@ -533,18 +665,18 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 new_type = GGML_TYPE_Q6_K;
             }
         }
-    } else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
-        // MoE   tensors -> MXFP4
-        // other tensors -> Q8_0
+    } else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE || ftype == LLAMA_FTYPE_MOSTLY_MXFP4_E4M3_MOE) {
+        // MoE   tensors -> MXFP4 / MXFP4_E4M3
+        // other tensors -> MXFP8
         // MLA projection tensors are also 3D, so match expert tensor roles explicitly.
         const bool is_bailingmoe3_expert = arch == LLM_ARCH_BAILINGMOE3 &&
             (category == tensor_category::FFN_UP ||
              category == tensor_category::FFN_GATE ||
              category == tensor_category::FFN_DOWN);
         if (tensor->ne[2] > 1 && (arch != LLM_ARCH_BAILINGMOE3 || is_bailingmoe3_expert)) {
-            new_type = GGML_TYPE_MXFP4;
+            new_type = ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE ? GGML_TYPE_MXFP4 : GGML_TYPE_MXFP4_E4M3;
         } else {
-            new_type = GGML_TYPE_Q8_0;
+            new_type = GGML_TYPE_MXFP8;
         }
     } else if (category == tensor_category::TOKEN_EMBD) {
         if (qs.params->token_embedding_type < GGML_TYPE_COUNT) {
@@ -738,6 +870,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 }
 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
+
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
         return tensor->type;
@@ -1013,6 +1146,14 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
+        case LLAMA_FTYPE_MOSTLY_MXFP8:     return GGML_TYPE_MXFP8;
+        case LLAMA_FTYPE_MOSTLY_MXFP6:     return GGML_TYPE_MXFP6;
+        case LLAMA_FTYPE_MOSTLY_MXFP4_E4M3: return GGML_TYPE_MXFP4_E4M3;
+        case LLAMA_FTYPE_MOSTLY_MXFP4_E4M3_MOE: return GGML_TYPE_MXFP4_E4M3;
+        case LLAMA_FTYPE_MOSTLY_MXFP4:     return GGML_TYPE_MXFP4;
+        case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4: return GGML_TYPE_Q4_0_ROCMI4;
+        case LLAMA_FTYPE_MOSTLY_Q4_0_SYM4:   return GGML_TYPE_Q4_0_SYM4;
 
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:

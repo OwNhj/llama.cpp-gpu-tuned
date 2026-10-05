@@ -492,6 +492,88 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 
+// W8A8 fp8 WMMA vec_dot (RDNA4 / gfx12): x tile = 256 raw E4M3 bytes (64 ints) + x-scales as float,
+// y tile = 128 raw E4M3 bytes (32 ints) + 4 scales as float (block_q8_1_mmq D4 layout, e4m3-quantized y).
+// Serves the e4m3-based types:
+//   - MXFP8 : x-scales = 8 E8M0 per 32 elems (stride 76, same as Q8_0 layout),  x_scale_ints = 8 (32 elems / 4 bytes per int)
+//   - MXFP4 : x-scales = 8 E8M0 per 32 elems (stride 76, same as Q8_1 layout),  x_scale_ints = 8 (32 elems / 4 bytes per int)
+//   - NVFP4 : x-scales = 16 UE4M3 per 16 elems (stride 84, generic NVFP4 layout), x_scale_ints = 4 (16 elems / 4 bytes per int)
+// NOTE: x_scale_ints is the divisor of k0 (in INT units) to index the per-scale row; the scale spacing is 4 bytes.
+// The MXFP4 / NVFP4 e2m1 weights are expanded to e4m3 at tile load (exact, e2m1 values are a subset
+// of e4m3), so the W8A8 fp8 product is lossless. On other archs the mainline int8 WMMA paths are kept.
+// Forward declaration (defined below; only needed for the non-RDNA4 NVFP4 fallback).
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
+
+template <ggml_type type, int J, bool fallback, int x_scale_ints, int x_tile_ints = 8>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_fp8_mma(
+    const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    // x_tile_ints = ints (4 e4m3 bytes each) per ldmatrix/mma k-tile. Must equal the scale
+    // spacing so that one dA covers the whole tile: 8 for MXFP4/MXFP8 (scale per 32 elems),
+    // 4 for NVFP4 (scale per 16 elems). fp8 WMMA is K=16 (4 ints); an 8-int tile issues 2.
+    constexpr data_layout input_layout = get_input_data_layout();
+    typedef tile<16,  x_tile_ints, int, input_layout>         tile_A;
+    typedef tile<16,  x_tile_ints, int, input_layout>         tile_B;
+    typedef tile<16, 16, float, DATA_LAYOUT_J_MAJOR> tile_C;
+
+    constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+
+    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+
+    const int   * x_qs = (const int   *) x;
+    const float * x_df = (const float *) x_qs + 2*MMQ_TILE_NE_K;
+    const int   * y_qs = (const int   *) y + 4;
+    const float * y_df = (const float *) y;
+
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += x_tile_ints) {
+        const int k0 = k00 + k01;
+
+        tile_A A[ntx];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+            tile_B B;
+            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+            const float dB = y_df[(j0 + tile_C::get_j(0))*MMQ_TILE_Y_K + k01/QI8_1];
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n], B);
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+                    const float dA = x_df[i*sram_stride + k0/x_scale_ints];
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                }
+            }
+        }
+    }
+#else
+    // Non-RDNA4: keep the mainline int8 WMMA behavior (load_tiles_mxfp4_fp8 / _nvfp4_fp8
+    // fall back to the int8 loaders to match). MXFP8 is gated to RDNA4 in should_use_mmq.
+    if constexpr (type == GGML_TYPE_NVFP4) {
+        ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>(x, y, sum, k00);
+    } else if constexpr (type == GGML_TYPE_MXFP4) {
+        ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>(x, y, sum, k00);
+    } else {
+        GGML_UNUSED_VARS(x, y, sum, k00);
+        NO_DEVICE_CODE;
+    }
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+}
+
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_1_q8_1_dp4a(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
@@ -747,7 +829,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 // Used for Q3_K, IQ2_S, and IQ2_XS:
-template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma(
+template <ggml_type type, int J, bool fallback, ggml_prec prec_src1> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
@@ -1511,3 +1593,153 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+
+#if GGML_ROCMI4_W4A4
+// ---------------------------------------------------------------------------
+// Q4_0_ROCMI4 native-i4 W4A4 (gfx12): v_wmma_i32_16x16x32_iu4 over packed nibbles.
+// x row (44 ints, K=256): [32 int data][8 float scale][4 pad]
+// y row (36 ints, K=128): [4 float scale][16 int data (int 4..19)][pad]
+// Per-thread slices (verified by random-matmul unit test on gfx1201):
+//   A/B: row = lane%16, K = (lane/16)*16 + half*8 + nibble
+//   D:   col = lane%16, row = (lane/16)*8 + l
+// k00 = 0/32 (int offsets, = element 0/128); k01 iterates 4x 32-elem segments.
+// Requires J % 16 == 0 (config provides only such CASEs when W4A4 is enabled).
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_rocmi4_w4a4(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int ntx           = rows_per_warp / 16; // j-tiles per i-warp group
+
+    const int lane    = threadIdx.x;
+    const int yw      = threadIdx.y;
+    const int i0_base = (yw / ntx) * rows_per_warp;
+    const int j0_base = (yw % ntx) * 16;
+    const int koff    = (lane / 16) * 2;   // data int offset within a 32-elem segment
+    const int rcol    = lane % 16;
+
+#pragma unroll
+    for (int i0 = i0_base; i0 < i0_base + rows_per_warp; i0 += 16) {
+        // k01 rolled (no unroll): limiting in-flight i4 mma accumulators keeps us under the
+        // 256-vgpr limit. Fully unrolling k01(4x) x j0(8x) replicates D(8 vgpr) and spills ~800B.
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            // k00 = 0/32 int8-units = element 0/128; a 32-elem segment = 4 data ints.
+            // x row (K=256): data int (k00/8+seg)*4, scale int 32+(k00/8+seg).
+            // y row (K=128, copy already positioned by by0): data int 4+seg*4, scale int seg.
+            const int seg  = k01 / QI8_0;   // 0..3
+            const int xseg = k00 / 8 + seg; // 0..7 global 32-elem segment of the x row
+
+            // x data is constant across all j0 tiles: hoist out (like the int8 mma path).
+            // (Do NOT hoist the 8 dA scales: that adds 32 live regs and spills the 64-summation array.)
+            const int32x2_t A = *(const int32x2_t *) (x + (i0 + rcol) * 44 + xseg*4 + koff);
+
+            // Match the proven structure (fork W4A4 / int8 mma path): k01 ROLLED above,
+            // j0 UNROLLED here. D is consumed by the l-epilogue immediately, so its live
+            // range stays short and the 64-sum tile fits. (k01-unroll x dA-hoist was what
+            // multiplied live state and spilled ~800B.)
+#pragma unroll
+            for (int j0 = j0_base; j0 < J; j0 += ntx * 16) {
+                const int32x2_t B = *(const int32x2_t *) (y + (j0 + rcol) * MMQ_TILE_Y_K + 4 + seg*4 + koff);
+                const float dB = ((const float *) (y + (j0 + rcol) * MMQ_TILE_Y_K))[seg];
+
+                int32x8_t D = {0,0,0,0,0,0,0,0};
+                mma_iu4_gfx12<true, true>(D, A, B);
+
+#pragma unroll
+                for (int l = 0; l < 8; l++) {
+                    // D rows for this lane = (lane/16)*8+l: the weight scale is per i row.
+                    const float dA = ((const float *) (x + (i0 + (lane/16)*8 + l) * 44 + 32))[xseg];
+                    sum[(j0/16)*(rows_per_warp/16)*8 + ((i0 - i0_base)/16)*8 + l] += (float) D[l] * dA * dB;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q4_0_SYM4 W4A4. Identical to the ROCMI4 W4A4 vec_dot except that the weight nibble n means
+// (n + 0.5)*sx, so the product picks up an extra term:
+//
+//   sum_i (n_i + 0.5)*sx * (m_i*dB) = sx*dB*sum_i(n_i*m_i) + 0.5*sx*dB*sum_i m_i
+//
+// The MMA still computes sum_i(n_i*m_i) from the raw nibbles (the 2n+1 trick used by the
+// W8A8 loader cannot work here -- 2n+1 spans [-15,15], five bits, and iu4 reads 4-bit
+// nibbles directly). The second term comes from SumM, which the activation packer writes at
+// ints 20..23 of the y row for this type. Both terms share dA and dB, so they fold into one
+// multiply-add per accumulator entry.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_sym4_w4a4(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int ntx           = rows_per_warp / 16;
+
+    const int lane    = threadIdx.x;
+    const int yw      = threadIdx.y;
+    const int i0_base = (yw / ntx) * rows_per_warp;
+    const int j0_base = (yw % ntx) * 16;
+    const int koff    = (lane / 16) * 2;
+    const int rcol    = lane % 16;
+
+#pragma unroll
+    for (int i0 = i0_base; i0 < i0_base + rows_per_warp; i0 += 16) {
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            const int seg  = k01 / QI8_0;   // 0..3
+            const int xseg = k00 / 8 + seg; // 0..7 global 32-elem segment of the x row
+
+            const int32x2_t A = *(const int32x2_t *) (x + (i0 + rcol) * 44 + xseg*4 + koff);
+
+#pragma unroll
+            for (int j0 = j0_base; j0 < J; j0 += ntx * 16) {
+                const int32x2_t B = *(const int32x2_t *) (y + (j0 + rcol) * MMQ_TILE_Y_K + 4 + seg*4 + koff);
+                const float dB   = ((const float *) (y + (j0 + rcol) * MMQ_TILE_Y_K))[seg];
+                const float sumM = ((const float *) (y + (j0 + rcol) * MMQ_TILE_Y_K))[20 + seg];
+
+                int32x8_t D = {0,0,0,0,0,0,0,0};
+                mma_iu4_gfx12<true, true>(D, A, B);
+
+#pragma unroll
+                for (int l = 0; l < 8; l++) {
+                    const float dA = ((const float *) (x + (i0 + (lane/16)*8 + l) * 44 + 32))[xseg];
+                    sum[(j0/16)*(rows_per_warp/16)*8 + ((i0 - i0_base)/16)*8 + l] +=
+                        dA * dB * ((float) D[l] + 0.5f * sumM);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_write_back_rocmi4_w4a4(
+        const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
+        const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max) {
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int ntx           = rows_per_warp / 16;
+
+    const int lane  = threadIdx.x;
+    const int yw    = threadIdx.y;
+    const int i0_base = (yw / ntx) * rows_per_warp;
+    const int j0_base = (yw % ntx) * 16;
+    const bool y_scale_used = y_scale != nullptr;
+
+#pragma unroll
+    for (int j0 = j0_base; j0 < J; j0 += ntx * 16) {
+        const int j = j0 + lane % 16;
+        if (j > j_max) {
+            return;
+        }
+        const float scl = y_scale_used ? y_scale[j] : 1.0f;
+
+#pragma unroll
+        for (int it = 0; it < rows_per_warp/16; it++) {
+#pragma unroll
+            for (int l = 0; l < 8; l++) {
+                const int i = i0_base + it * 16 + (lane / 16) * 8 + l;
+                if (fallback && i > i_max) {
+                    continue;
+                }
+                dst[ids_dst[j]*stride + i] = sum[(j0/16)*(rows_per_warp/16)*8 + it*8 + l] * scl;
+            }
+        }
+    }
+}
+#endif // GGML_ROCMI4_W4A4

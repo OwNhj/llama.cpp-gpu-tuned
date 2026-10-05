@@ -157,6 +157,18 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q3_0_ROCMFPX_AGENT    = 113,
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT    = 114,
+        LLAMA_FTYPE_MOSTLY_Q8_0_ROCMFPX_AGENT    = 115,
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_LEAN     = 116,
+        LLAMA_FTYPE_MOSTLY_Q6_0_ROCMFPX_AGENT_LEAN = 117,
+        LLAMA_FTYPE_MOSTLY_Q4_0_ROCMI4           = 118, // native signed-nibble 4-bit + UE4M3
+        LLAMA_FTYPE_MOSTLY_Q4_0_SYM4             = 119, // symmetric 4-bit grid, 17 B block
+        LLAMA_FTYPE_MOSTLY_MXFP8         = 42, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_MXFP4         = 43, // except 1d tensors, dense MXFP4 (E2M1 + E8M0 per 32)
+        LLAMA_FTYPE_MOSTLY_MXFP6         = 44, // except 1d tensors, MXFP6 (E2M3 + E8M0 per 32)
+        LLAMA_FTYPE_MOSTLY_MXFP4_E4M3    = 45, // except 1d tensors, MXFP4 with a UE4M3 block scale
+        LLAMA_FTYPE_MOSTLY_MXFP4_E4M3_MOE = 46, // except 1d tensors, experts in MXFP4_E4M3
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -491,6 +503,7 @@ extern "C" {
     LLAMA_API void llama_backend_free(void);
 
     // Optional: enable numa optimizations
+    // TODO: deprecate and make part of llama_backend_init()
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 
     // Optional: an auto threadpool gets created in ggml if not passed explicitly

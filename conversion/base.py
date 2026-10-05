@@ -170,6 +170,7 @@ class ModelBase:
         self.dir_model_card = dir_model  # overridden in convert_lora_to_gguf.py
         self._is_nvfp4 = False
         self._is_mxfp4 = False
+        self._is_mxfp8 = False
         self._nvfp4_global_algo: str | None = None # checkpoint-wide NVFP4 quant_algo
         self._nvfp4_layer_algo: dict[str, str | None] = {} # per-layer quant_algo, keyed by HF module path
         self._prec_a4: dict[str, bool] = {} # gguf tensor name -> can use 4-bit (A4) activations
@@ -234,7 +235,7 @@ class ModelBase:
 
         prefix = "model" if not self.is_mistral_format else "consolidated"
         part_names: list[str] = ModelBase.get_model_part_names(self.dir_model, prefix, ".safetensors")
-        is_safetensors: bool = len(part_names) > 0
+        is_safetensors: bool = len(part_names) > 0 or (not self.is_mistral_format and (self.dir_model / "model.safetensors.index.json").is_file())
         if not is_safetensors:
             part_names = ModelBase.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
 
@@ -324,8 +325,8 @@ class ModelBase:
             self.gguf_writer.add_tensor(scale_name, scale_vals)
 
     def dequant_model(self):
-        # If all quantized tensors were already handled (e.g. pure NVFP4), skip
-        if self._is_nvfp4 and not any(k.endswith((".weight_scale", ".weight_scale_inv")) for k in self.model_tensors):
+        # If all quantized tensors were already handled (e.g. pure NVFP4/MXFP8), skip
+        if (self._is_nvfp4 or self._is_mxfp8) and not any(k.endswith((".weight_scale", ".weight_scale_inv")) for k in self.model_tensors):
             return
 
         tensors_to_remove: list[str] = []
@@ -955,6 +956,116 @@ class ModelBase:
 
         del experts, merged
 
+    @staticmethod
+    def _mxfp8_e8m0_bytes(scale: Tensor) -> np.ndarray:
+        """Convert a per-32-group OCP MX scale tensor to raw E8M0 bytes (uint8)."""
+        if scale.dtype in (torch.uint8,):
+            return scale.view(torch.uint8).numpy()
+        # some exporters store the E8M0 in an fp8 or a float dtype; recover the byte
+        if scale.dtype == torch.float8_e8m0fnu:
+            return scale.view(torch.uint8).numpy()
+        if scale.dtype in (torch.float16, torch.float32, torch.float64):
+            s = scale.float().numpy()
+            with np.errstate(divide="ignore"):
+                p = np.log2(np.clip(s, 1e-30, None))
+            e8m0 = np.round(p + 127).astype(np.uint8)
+            return np.clip(e8m0, 0, 254)
+        return scale.view(torch.uint8).numpy()
+
+    @staticmethod
+    def _mxfp8_pack(weight: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
+        """Repack OCP MXFP8 HF tensors (E4M3 weights + E8M0 per-32 scale) into the
+        gguf block_mxfp8 layout: per 256-element block [256 qs bytes][8 e bytes].
+        Returns (raw_data, logical_shape)."""
+
+        out_features = weight.shape[0]
+        in_features = weight.shape[1]
+        n_blocks = in_features // 256
+
+        w = weight.view(torch.uint8).numpy().reshape(out_features, n_blocks, 256)
+        # ModelBase._mxfp8_e8m0_bytes is a staticmethod on this class, so it has to be referenced
+        # through the class -- the bare name is not bound inside another staticmethod, which raised
+        # NameError and made the whole OCP MXFP8 repack path unusable.
+        s = ModelBase._mxfp8_e8m0_bytes(scale).reshape(out_features, n_blocks, 8)
+
+        raw = np.concatenate([w, s], axis=-1).reshape(out_features, n_blocks * 264)
+        return raw, [out_features, in_features]
+
+    def _repack_mxfp8(self, name: str, weight: Tensor, scale: Tensor):
+        new_name = self.map_tensor_name(name)
+
+        raw, shape = self._mxfp8_pack(weight, scale)
+        logger.info(f"Repacked {new_name} with shape {shape} and quantization MXFP8")
+        self.gguf_writer.add_tensor(new_name, raw, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
+
+    def _generate_mxfp8_tensors(self):
+        # Per-layer expert merging to avoid holding all experts in memory
+        expert_blocks: dict[tuple[int, str], list[tuple[int, np.ndarray]]] = {}
+        expert_shapes: dict[tuple[int, str], list[int]] = {}
+        n_experts = self.find_hparam(["num_local_experts", "num_experts"], optional=True) or 0
+        consumed: list[str] = []
+
+        for name in self.model_tensors.keys():
+            if not name.endswith(".weight"):
+                continue
+            scale_name = name.replace(".weight", ".weight_scale")
+            if scale_name not in self.model_tensors:
+                continue
+
+            weight = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
+
+            # only OCP MX per-32-group scales are repacked; skip anything else
+            # (e.g. 1D per-channel FP8 scales, handled by dequant_model)
+            in_features = weight.shape[-1]
+            if weight.dim() != 2 or in_features % 256 != 0 or scale.shape[-1] != in_features // 32:
+                continue
+
+            consumed.extend([name, scale_name])
+
+            # Check if this is a per-expert tensor
+            m = re.search(r'\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
+            if m:
+                expert_id = int(m.group(1))
+                proj_type = m.group(2)
+                bid_m = re.search(r'\.layers\.(\d+)\.', name)
+                bid = int(bid_m.group(1)) if bid_m else 0
+                key = (bid, proj_type)
+
+                raw, shape = self._mxfp8_pack(weight, scale)
+
+                if key not in expert_blocks:
+                    expert_blocks[key] = []
+                    expert_shapes[key] = shape
+                expert_blocks[key].append((expert_id, raw.copy()))
+
+                # Flush when all experts for this (layer, proj) are collected
+                if n_experts > 0 and len(expert_blocks[key]) >= n_experts:
+                    self._flush_mxfp8_experts(key, expert_blocks, expert_shapes, bid, proj_type)
+            else:
+                self._repack_mxfp8(name, weight, scale)
+
+        # Flush any remaining experts (fallback if n_experts was unknown)
+        for bid, proj_type in list(expert_blocks.keys()):
+            self._flush_mxfp8_experts((bid, proj_type), expert_blocks, expert_shapes, bid, proj_type)
+
+        # Remove consumed tensors so get_tensors/modify_tensors won't see them
+        for name in consumed:
+            self.model_tensors.pop(name, None)
+
+    def _flush_mxfp8_experts(self, key, expert_blocks: dict, expert_shapes: dict, bid: int, proj_type: str):
+        experts = expert_blocks.pop(key)
+        shape = expert_shapes.pop(key)
+
+        experts.sort(key=lambda x: x[0])
+        merged = np.stack([e[1] for e in experts], axis=0)
+        merged_name = f"model.layers.{bid}.mlp.experts.{proj_type}.weight"
+        new_name = self.map_tensor_name(merged_name)
+        logger.info(f"Repacked {new_name} with shape [{len(experts)}, {shape[0]}, {shape[1]}] and quantization MXFP8")
+        self.gguf_writer.add_tensor(new_name, merged, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
+
+        del experts, merged
+
     def prepare_tensors(self):
         # detect NVFP4 quantization (ModelOpt and Compressed-tensors formats)
         quantization_config = self.hparams.get("quantization_config") or {}
@@ -1000,6 +1111,19 @@ class ModelBase:
         self._is_nvfp4 = quant_algo in ("NVFP4", "W4A16_NVFP4")
         self._is_mxfp4 = quant_method == "mxfp4"
 
+        # detect OCP MXFP8 (ModelOpt quant_algo="MXFP8" or compressed-tensors weights.type="mx")
+        mxfp8_compressed_tensors = quant_method == "compressed-tensors" and any(
+            (g.get("weights") or {}).get("type") == "mx"
+            for g in quant_groups.values() if isinstance(g, dict)
+        )
+        if quant_algo != "MXFP8":
+            if mxfp8_compressed_tensors:
+                quant_algo = "MXFP8"
+            elif any(str(v.get("quant_algo")).endswith("MXFP8") for v in quant_layers.values() if isinstance(v, dict)):
+                quant_algo = "MXFP8"
+
+        self._is_mxfp8 = quant_algo == "MXFP8"
+
         # Per-tensor NVFP4 precision.
         self._nvfp4_layer_algo = {}
         if quant_layers:
@@ -1043,6 +1167,11 @@ class ModelBase:
                         if input_scale_name not in self.model_tensors:
                             self.model_tensors[input_scale_name] = inverse_scale(self.model_tensors.pop(name))
             self._generate_nvfp4_tensors()
+
+        # MXFP8 weights are repacked and written directly to gguf_writer,
+        # before dequant_model so they are removed from model_tensors.
+        if self._is_mxfp8:
+            self._generate_mxfp8_tensors()
 
         self.dequant_model()
 
@@ -1148,6 +1277,12 @@ class ModelBase:
                         data_qtype = gguf.GGMLQuantizationType.BF16
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
                         data_qtype = gguf.GGMLQuantizationType.Q8_0
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_MXFP8:
+                        data_qtype = gguf.GGMLQuantizationType.MXFP8
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_MXFP6:
+                        data_qtype = gguf.GGMLQuantizationType.MXFP6
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_MXFP4_E4M3:
+                        data_qtype = gguf.GGMLQuantizationType.MXFP4_E4M3
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ1_0:
                         data_qtype = gguf.GGMLQuantizationType.TQ1_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
@@ -1205,6 +1340,8 @@ class ModelBase:
                 self.ftype = gguf.LlamaFileType.MOSTLY_NVFP4
             elif self._is_mxfp4:
                 self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
+            elif self._is_mxfp8:
+                self.ftype = gguf.LlamaFileType.MOSTLY_MXFP8
 
         # Generate parameter weight class (useful for leader boards) if not yet determined
         if self.metadata.size_label is None and total_params > 0:
@@ -1268,10 +1405,16 @@ class ModelBase:
         return inner
 
     @staticmethod
-    def load_hparams(dir_model: Path, is_mistral_format: bool):
+    def load_hparams(dir_model: Path, is_mistral_format: bool, guess: bool = True):
         if is_mistral_format:
             with open(dir_model / "params.json", "r", encoding="utf-8") as f:
                 config = json.load(f)
+            return config
+
+        # checkpoints with a non-HF layout are matched by their own loader
+        # models with a HF layout can also register a hparams loader to switch to a custom class
+        config = ModelBase.load_hparams_guess(dir_model) if guess and dir_model.is_dir() else None
+        if config is not None:
             return config
 
         try:
@@ -1280,10 +1423,6 @@ class ModelBase:
             config = AutoConfig.from_pretrained(dir_model, trust_remote_code=False).to_dict()
         except Exception as e:
             logger.warning(f"Failed to load model config from {dir_model}: {e}")
-            if not (dir_model / "config.json").is_file():
-                config = ModelBase.load_hparams_guess(dir_model)
-                if config is not None:
-                    return config
             logger.warning("Trying to load config.json instead")
             with open(dir_model / "config.json", "r", encoding="utf-8") as f:
                 config = json.load(f)
@@ -1936,6 +2075,9 @@ class TextModel(ModelBase):
         if chkhsh == "653660222fb704f61cbf2b618a8ae6502b7f8b20c980f9a5de07ed78e13319cd":
             # ref: https://huggingface.co/ufakai/ufakzeka-1
             res = "ufakzeka"
+        if chkhsh == "4b05e02dad1c5ae07d266fd3342ddb644c6f6be058d728bc0a33af31a1d6ee66":
+            # ref: https://huggingface.co/jhu-clsp/mmBERT-base
+            res = "mmbert"
 
         if res is None:
             logger.warning("\n")
@@ -2326,6 +2468,12 @@ class TextModel(ModelBase):
                 raise NotImplementedError("Only MEAN, CLS, and LAST pooling types supported")
             self.gguf_writer.add_pooling_type(pooling_type)
 
+        # pooling before a classification head (e.g. ModernBertForSequenceClassification)
+        if (classifier_pooling := self.hparams.get("classifier_pooling")) is not None:
+            if classifier_pooling not in ("cls", "mean"):
+                raise NotImplementedError(f"Unsupported classifier_pooling: {classifier_pooling}")
+            self.gguf_writer.add_classifier_pooling_type(mode_mapping[classifier_pooling])
+
     def _set_vocab_glmedge(self):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
@@ -2559,6 +2707,11 @@ class TextModel(ModelBase):
         self.gguf_writer.add_eot_token_id(4)
 
         self.gguf_writer.add_add_space_prefix(False)
+
+        if (add_bos := tokenizer_config.get("add_bos_token")) is not None:
+            self.gguf_writer.add_add_bos_token(add_bos)
+        if (add_eos := tokenizer_config.get("add_eos_token")) is not None:
+            self.gguf_writer.add_add_eos_token(add_eos)
 
 
 class MmprojModel(ModelBase):
@@ -2867,6 +3020,11 @@ else:
     # Older torch builds do not expose F8_E8M0. Keep the raw bytes so callers
     # that know the format can decode them explicitly.
     LazyTorchTensor._dtype_str_map["F8_E8M0"] = torch.uint8
+
+
+def jinja_str_or_json(name: str) -> str:
+    # jinja expression that renders a variable as-is if it is a string, as JSON otherwise
+    return "{{ " + name + " if " + name + " is string else " + name + " | tojson }}"
 
 
 def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> str:

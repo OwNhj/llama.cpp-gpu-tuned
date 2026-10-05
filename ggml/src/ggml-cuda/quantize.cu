@@ -131,8 +131,6 @@ static __global__ void quantize_mmq_nvfp4(
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int n_expert_used) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
 
-    const int64_t blocks_per_col = (ne0 + QK_FP4_MMQ - 1) / QK_FP4_MMQ;
-
     int64_t base_idx;
     if constexpr (scatter) {
         base_idx = (int64_t) blockIdx.x * s02; // one physical row per token
@@ -317,7 +315,8 @@ static __global__ void quantize_mmq_nvfp4(
                 reinterpret_cast<uint8_t *>(yb->d4)[sub] = fp8_code;
             }
         } else {
-            block_fp4_mmq * yb = y + (blockIdx.y * ((int64_t) blocks_per_col * ne1) + k_block * ne1 + blockIdx.x);
+            const int64_t blocks_per_col = (ne0 + QK_FP4_MMQ - 1) / QK_FP4_MMQ;
+            block_fp4_mmq * yb = y + (blockIdx.y * (blocks_per_col * ne1) + k_block * ne1 + blockIdx.x);
             uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
             yqs[2 * sub + 0] = q0;
             yqs[2 * sub + 1] = q1;
@@ -454,7 +453,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool i4_grid = false, bool sym4 = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -512,12 +511,60 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
 
-    const float d_inv = 127.0f / amax;
+    const float d_inv = i4_grid ? (amax > 0.0f ? 7.0f / amax : 0.0f) : 127.0f / amax;
     char4 q;
-    q.x = roundf(xi.x*d_inv);
-    q.y = roundf(xi.y*d_inv);
-    q.z = roundf(xi.z*d_inv);
-    q.w = roundf(xi.w*d_inv);
+    q.x = 0; q.y = 0; q.z = 0; q.w = 0;
+    if constexpr (i4_grid) {
+        // gfx12 native-i4 W4A4: activations onto a signed 4-bit grid [-7,+7].
+        // y VRAM row = 36 ints per 128 elements (block_q8_1_mmq, same pipeline as int8):
+        //   [4 float scales (per 32 elem)][data int 4..19 = 128 nibbles, natural order][pad].
+        const int c0 = (int) fminf(fmaxf(roundf(xi.x*d_inv), -8.0f), 7.0f);
+        const int c1 = (int) fminf(fmaxf(roundf(xi.y*d_inv), -8.0f), 7.0f);
+        const int c2 = (int) fminf(fmaxf(roundf(xi.z*d_inv), -8.0f), 7.0f);
+        const int c3 = (int) fminf(fmaxf(roundf(xi.w*d_inv), -8.0f), 7.0f);
+        // One nibble per byte, matching the weight packer's byte-interleaved
+        // order: the odd thread of each pair holds the next four values, which
+        // merge into this dword's high nibbles.
+        const int lo4 = (c0 & 0xF) | ((c1 & 0xF) << 8) | ((c2 & 0xF) << 16) | ((c3 & 0xF) << 24);
+        const int hi4 = __shfl_xor_sync(0xFFFFFFFF, lo4, 1, WARP_SIZE);
+        const int64_t row = (i0 / 128) * ne1 + (scatter ? ids[(int64_t)blockIdx.x * n_expert_used] : blockIdx.x);
+        const int packed = lo4 | (hi4 << 4);
+        // 16 consecutive ints per 128-elem block live one per even lane. Gather 4 per leader
+        // lane (threadIdx.x % 8 == 0) so the data dword store is one 16B write per 4 lanes.
+        const int lane = threadIdx.x % WARP_SIZE;
+        int4 pack4;
+        pack4.x = __shfl_sync(0xFFFFFFFF, packed, (lane & ~7) + 0, WARP_SIZE);
+        pack4.y = __shfl_sync(0xFFFFFFFF, packed, (lane & ~7) + 2, WARP_SIZE);
+        pack4.z = __shfl_sync(0xFFFFFFFF, packed, (lane & ~7) + 4, WARP_SIZE);
+        pack4.w = __shfl_sync(0xFFFFFFFF, packed, (lane & ~7) + 6, WARP_SIZE);
+        if (lane % 8 == 0) {
+            ((int4 *) y)[row * MMQ_TILE_Y_K / 4 + 1 + lane / 8] = pack4;
+        }
+        if (iqs % 32 == 0) {
+            // store FLOAT bits via float* lvalue: an int lvalue would truncate 0.139 -> 0
+            ((float *) y)[row * MMQ_TILE_Y_K + (i0 % 128) / 32] = d_inv > 0.0f ? 1.0f / d_inv : 0.0f;
+        }
+        // Q4_0_SYM4 needs sum_i m_i for its epilogue correction. Emit it into ints 20..23 of
+        // the y row, which ROCMI4's W4A4 vec_dot never reads (it uses ints 4..19 for data and
+        // floats 0..3 for scales), so the two types can share one activation buffer layout.
+        // The reduction must run for EVERY lane -- a shuffle inside the `iqs % 32 == 0`
+        // guard below would only be reached by 1/8 of the warp, which is undefined.
+        if (sym4) {
+            int sum4 = c0 + c1 + c2 + c3;
+#pragma unroll
+            for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+                sum4 += __shfl_xor_sync(0xFFFFFFFF, sum4, offset, WARP_SIZE);
+            }
+            if (iqs % 32 == 0) {
+                ((float *) y)[row * MMQ_TILE_Y_K + 20 + (i0 % 128) / 32] = (float) sum4;
+            }
+        }
+    } else {
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        q.z = roundf(xi.z*d_inv);
+        q.w = roundf(xi.w*d_inv);
+    }
     const float d = 1.0f / d_inv;
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
@@ -533,6 +580,9 @@ static __global__ void quantize_mmq_q8_1(
             ib = ib0 + k_block*ne1 + blockIdx.x;
         }
 
+        if constexpr (i4_grid) {
+            continue; // rows were written above
+        }
         // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
         char4 * yqs4 = (char4 *) y[ib].qs;
         yqs4[iqs/4] = q;
@@ -583,6 +633,27 @@ void quantize_mmq_q8_1_cuda(
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+#if GGML_ROCMI4_W4A4
+    // gfx12 native i4 W4A4: activations pre-quantized to a signed 4-bit grid (dense path only;
+    // MoE W4A4 is diverted to cuBLAS by ggml_cuda_should_use_mmq).
+    //
+    // Q4_0_SYM4 shares ROCMI4's 4-bit grid geometry, but its weight nibble carries a +0.5
+    // offset, so its vec_dot additionally needs SumM (the sum of the 4-bit codes per
+    // 32-element group). The sym4 template parameter makes the packer emit that into the y
+    // row; ROCMI4 passes false and is unaffected.
+    if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        if (type_src0 == GGML_TYPE_Q4_0_ROCMI4) {
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true, false><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            return;
+        }
+        if (type_src0 == GGML_TYPE_Q4_0_SYM4) {
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true, true><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            return;
+        }
+    }
+#endif
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>
@@ -630,6 +701,121 @@ void quantize_scatter_mmq_q8_1_cuda(
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+template <bool scatter>
+static __global__ void quantize_mmq_mxfp8(
+        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used) {
+
+    const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i00 = i0;
+    ggml_cuda_pdl_sync();
+
+    int64_t base_idx;
+    if constexpr (scatter) {
+        base_idx = (int64_t) blockIdx.x * s02; // one physical row per token
+    } else {
+        const int64_t i2  = blockIdx.z % ne2;
+        const int64_t i3  = blockIdx.z / ne2;
+        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
+        base_idx = i3*s03 + i2*s02 + i01*s01;
+    }
+
+    const float4 * x4 = (const float4 *) x;
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+
+    const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
+    const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
+
+    // Load 4 floats per thread and calculate max. abs. value between them:
+    const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+
+    // Exchange max. abs. value between 8 threads (32 values per scale).
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    // An all-zero block (the K padding past ne00, or a genuinely zero activation row) has amax == 0,
+    // and 448/0 = +Inf would turn every 0.0f element into 0*Inf = NaN. The i4 path above guards
+    // both the reciprocal and the scale for the same reason.
+    const float d_inv = amax > 0.0f ? 448.0f / amax : 0.0f;
+    // Two values per hardware conversion instruction (v_cvt_pk_fp8_f32 on gfx12) instead of one
+    // software encode per value: the scalar encoder needs a frexpf plus rounding branches, which
+    // made this kernel ~30% more expensive than its q8_1 counterpart. The d_inv scaling keeps
+    // |x*d_inv| <= 448, i.e. exactly the range the hardware conversion covers.
+    const uint32_t q01 = ggml_cuda_fp32x2_to_e4m3x2(xi.x*d_inv, xi.y*d_inv);
+    const uint32_t q23 = ggml_cuda_fp32x2_to_e4m3x2(xi.z*d_inv, xi.w*d_inv);
+    char4 q = make_char4((int8_t) (q01 & 0xFFu), (int8_t) ((q01 >> 8) & 0xFFu),
+                         (int8_t) (q23 & 0xFFu), (int8_t) ((q23 >> 8) & 0xFFu));
+    const float d = d_inv > 0.0f ? 1.0f / d_inv : 0.0f;
+
+    // write the block once (normal) or to each of the token's compact rows (scatter)
+    const int nwrite = scatter ? n_expert_used : 1;
+#pragma unroll
+    for (int slot = 0; slot < nwrite; ++slot) {
+        int64_t ib;
+        if constexpr (scatter) {
+            const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            ib = k_block*ne1 + i;
+        } else {
+            // first y-block of this channel slice (X*Y*B/QK8_1 == ne1*ne0/QK8_1_MMQ: 128-value blocks)
+            const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1);
+            ib = ib0 + k_block*ne1 + blockIdx.x;
+        }
+
+        // Write back 4 E4M3 values as a single 32 bit value for better memory bandwidth:
+        char4 * yqs4 = (char4 *) y[ib].qs;
+        yqs4[iqs/4] = q;
+
+        if (iqs % 32 == 0) {
+            y[ib].d4[iqs/32] = d;
+        }
+    }
+    GGML_UNUSED(n_expert_used);
+}
+
+void quantize_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP8 || type_src0 == GGML_TYPE_MXFP6 || type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_MXFP4_E4M3 || type_src0 == GGML_TYPE_NVFP4);
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+
+    // ne1 tends to assume the highest values, therefore use it as the "x" dimension of the CUDA grid:
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_mxfp8<false>
+        <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+}
+
+// scatter=true reuses the quant kernel: grid over tokens, ids = inverse map (token slot -> compact row)
+void quantize_scatter_mmq_mxfp8_cuda(
+        const float * x, const int32_t * ids_src1_inv, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t stride_token, const int64_t ne0,
+        const int64_t n_tokens, const int64_t nrows_dst, const int n_expert_used, cudaStream_t stream) {
+    GGML_ASSERT(type_src0 == GGML_TYPE_MXFP8 || type_src0 == GGML_TYPE_MXFP6 || type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_MXFP4_E4M3 || type_src0 == GGML_TYPE_NVFP4);
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(n_tokens, block_num_y, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_mxfp8<true><<<num_blocks, block_size, 0, stream>>>(
+        x, ids_src1_inv, vy, ne00, /*s01=*/0, /*s02=*/stride_token, /*s03=*/0, ne0, /*ne1=*/(int) nrows_dst, /*ne2=*/1, n_expert_used);
 }
 
 // scatter=true reuses the quant kernels: grid over tokens, ids = inverse map (token slot -> compact row)

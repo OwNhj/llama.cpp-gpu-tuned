@@ -13,6 +13,8 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "../../rocmfp4/rocmfp4.h"
+#include "../../rocmfpx/rocmfpx.h"
 #include "common.h"
 #include "tiled/tiled.h"
 
@@ -212,6 +214,241 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+static inline uint32_t ggml_rocmfpx_get_bits_cpu(const uint8_t * src, int bit_pos, int nbits) {
+    const int byte_pos = bit_pos >> 3;
+    const int shift    = bit_pos & 7;
+    uint32_t v = src[byte_pos];
+
+    v |= (uint32_t) src[byte_pos + 1] << 8;
+    v |= (uint32_t) src[byte_pos + 2] << 16;
+
+    return (v >> shift) & ((1u << nbits) - 1u);
+}
+
+static inline int ggml_rocmfpx_decode_fp3_cpu(uint32_t code) {
+    static const int8_t table[8] = { 0, 1, 2, 4, 0, -1, -2, -4 };
+    return table[code & 7u];
+}
+
+static inline int ggml_rocmfpx_decode_fp2_cpu(uint32_t code) {
+    static const int8_t table[4] = { -4, -1, 1, 4 };
+    return table[code & 3u];
+}
+
+static void ggml_vec_dot_rocmfpx_fp2_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    assert(n % QK_ROCMFP2 == 0);
+    assert(QK_ROCMFP2 == QK8_0);
+
+    const block_rocmfp2 * GGML_RESTRICT x = (const block_rocmfp2 *) vx;
+    const block_q8_0    * GGML_RESTRICT y = (const block_q8_0 *) vy;
+    const int nb = n / QK_ROCMFP2;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dy = GGML_CPU_FP16_TO_FP32(y[ib].d);
+        int sumi0 = 0;
+        int sumi1 = 0;
+        for (int j = 0; j < QK_ROCMFP2/2; ++j) {
+            const uint8_t c0 = (x[ib].qs[j/4] >> (2*(j % 4))) & 3u;
+            const uint8_t c1 = (x[ib].qs[4 + j/4] >> (2*(j % 4))) & 3u;
+            sumi0 += ggml_rocmfpx_decode_fp2_cpu(c0) * (int) y[ib].qs[j];
+            sumi1 += ggml_rocmfpx_decode_fp2_cpu(c1) * (int) y[ib].qs[j + QK_ROCMFP2/2];
+        }
+        sumf += dy * (
+            rocmfpx_ue4m3_to_fp32(x[ib].e[0]) * (float) sumi0 +
+            rocmfpx_ue4m3_to_fp32(x[ib].e[1]) * (float) sumi1);
+    }
+    *s = sumf;
+}
+
+static inline int ggml_rocmfpx_decode_fp6_cpu(uint32_t code) {
+    const int mag = (int) (code & 31u);
+    return (code & 32u) ? -(mag == 0 ? 32 : mag) : mag;
+}
+
+static void ggml_vec_dot_rocmfpx_fp3_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    assert(n % QK_ROCMFP3 == 0);
+    assert(QK_ROCMFP3 == QK8_0);
+
+    const block_rocmfp3 * GGML_RESTRICT x = (const block_rocmfp3 *) vx;
+    const block_q8_0    * GGML_RESTRICT y = (const block_q8_0 *) vy;
+
+    const int nb = n / QK_ROCMFP3;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dy = GGML_CPU_FP16_TO_FP32(y[ib].d);
+
+        int sumi0 = 0;
+        int sumi1 = 0;
+        for (int j = 0; j < QK_ROCMFP3/2; ++j) {
+            const int q0 = ggml_rocmfpx_decode_fp3_cpu(ggml_rocmfpx_get_bits_cpu(x[ib].qs, j*3, 3));
+            const int q1 = ggml_rocmfpx_decode_fp3_cpu(ggml_rocmfpx_get_bits_cpu(x[ib].qs, (j + QK_ROCMFP3/2)*3, 3));
+            sumi0 += q0 * (int) y[ib].qs[j];
+            sumi1 += q1 * (int) y[ib].qs[j + QK_ROCMFP3/2];
+        }
+
+        sumf += dy * (
+            rocmfpx_ue4m3_to_fp32(x[ib].e[0]) * (float) sumi0 +
+            rocmfpx_ue4m3_to_fp32(x[ib].e[1]) * (float) sumi1);
+    }
+
+    *s = sumf;
+}
+
+static void ggml_vec_dot_rocmfpx_fp6_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    assert(n % QK_ROCMFP6 == 0);
+    assert(QK_ROCMFP6 == QK8_0);
+
+    const block_rocmfp6 * GGML_RESTRICT x = (const block_rocmfp6 *) vx;
+    const block_q8_0    * GGML_RESTRICT y = (const block_q8_0 *) vy;
+
+    const int nb = n / QK_ROCMFP6;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dy = GGML_CPU_FP16_TO_FP32(y[ib].d);
+
+        int sumi0 = 0;
+        int sumi1 = 0;
+        for (int j = 0; j < QK_ROCMFP6/2; ++j) {
+            const int q0 = ggml_rocmfpx_decode_fp6_cpu(ggml_rocmfpx_get_bits_cpu(x[ib].qs, j*6, 6));
+            const int q1 = ggml_rocmfpx_decode_fp6_cpu(ggml_rocmfpx_get_bits_cpu(x[ib].qs, (j + QK_ROCMFP6/2)*6, 6));
+            sumi0 += q0 * (int) y[ib].qs[j];
+            sumi1 += q1 * (int) y[ib].qs[j + QK_ROCMFP6/2];
+        }
+
+        sumf += dy * (
+            rocmfpx_ue4m3_to_fp32(x[ib].e[0]) * (float) sumi0 +
+            rocmfpx_ue4m3_to_fp32(x[ib].e[1]) * (float) sumi1);
+    }
+
+    *s = sumf;
+}
+
+static int8_t rocmi4_nibble_i8(uint8_t nibble) {
+    return (int8_t) ((nibble & 0x8u) ? (int) (nibble | 0xF0u) : (int) (nibble & 0x7u));
+}
+
+static void ggml_vec_dot_rocmi4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    assert(n % QK_ROCMI4 == 0);
+    assert(QK_ROCMI4 == QK8_0);
+
+    const block_rocmi4 * GGML_RESTRICT x = (const block_rocmi4 *) vx;
+    const block_q8_0   * GGML_RESTRICT y = (const block_q8_0 *) vy;
+
+    const int nb = n / QK_ROCMI4;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = rocmfpx_ue4m3_to_fp32(x[ib].e) * GGML_CPU_FP16_TO_FP32(y[ib].d);
+        int sumi = 0;
+        for (int j = 0; j < QS_ROCMI4; ++j) {
+            sumi += (int) rocmi4_nibble_i8(x[ib].qs[j] & 0x0Fu) * (int) y[ib].qs[j];
+            sumi += (int) rocmi4_nibble_i8(x[ib].qs[j] >> 4) * (int) y[ib].qs[j + QS_ROCMI4];
+        }
+        sumf += d * (float) sumi;
+    }
+
+    *s = sumf;
+}
+
+// Q4_0_SYM4 CPU fallback. Same nibble layout as ROCMI4, but the stored nibble n means
+// (n + 0.5) * s_x rather than n * s_x. Expanding the product:
+//
+//   sum_i (n_i + 0.5) * s_x * (m_i * d_y)
+//     = s_x * d_y * sum_i (n_i * m_i)  +  0.5 * s_x * d_y * sum_i m_i
+//     = s_x * d_y * sumi               +  0.5 * s_x * s_y
+//
+// The correction term needs sum_i m_i, and block_q8_1 carries exactly that as
+// `s = d_y * sum(qs)`. That is why this type's vec_dot_type is Q8_1 and not Q8_0.
+static void ggml_vec_dot_sym4_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    assert(n % QK_SYM4 == 0);
+    assert(QK_SYM4 == QK8_1);
+
+    const block_sym4 * GGML_RESTRICT x = (const block_sym4 *) vx;
+    const block_q8_1 * GGML_RESTRICT y = (const block_q8_1 *) vy;
+
+    const int nb = n / QK_SYM4;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float sx = rocmfpx_ue4m3_to_fp32(x[ib].e);
+        const float dy = GGML_CPU_FP16_TO_FP32(y[ib].d);
+
+        int sumi  = 0;
+        int sum_m = 0;   // exact sum of the int8 activations, in int32
+        for (int j = 0; j < QS_SYM4; ++j) {
+            sumi += (int) rocmi4_nibble_i8(x[ib].qs[j] & 0x0Fu) * (int) y[ib].qs[j];
+            sumi += (int) rocmi4_nibble_i8(x[ib].qs[j] >> 4)    * (int) y[ib].qs[j + QS_SYM4];
+        }
+        for (int j = 0; j < QK8_1; ++j) {
+            sum_m += (int) y[ib].qs[j];
+        }
+        // 0.5*sx*dy*sum(m) computed exactly rather than through the fp16 `s` field, which
+        // only has an 11-bit mantissa and is therefore the accuracy limit of the correction.
+        sumf += sx * dy * ((float) sumi + 0.5f * (float) sum_m);
+    }
+
+    *s = sumf;
+}
+
+static void ggml_vec_dot_rocmfpx_fp8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    assert(n % QK_ROCMFP8 == 0);
+    assert(QK_ROCMFP8 == QK8_0);
+
+    const block_rocmfp8 * GGML_RESTRICT x = (const block_rocmfp8 *) vx;
+    const block_q8_0    * GGML_RESTRICT y = (const block_q8_0 *) vy;
+
+    const int nb = n / QK_ROCMFP8;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float dx = rocmfpx_ue4m3_to_fp32(x[ib].e);
+        const float dy = GGML_CPU_FP16_TO_FP32(y[ib].d);
+        const float d  = dx * dy;
+
+        int sumi = 0;
+        for (int j = 0; j < QK_ROCMFP8; ++j) {
+            sumi += (int) x[ib].qs[j] * (int) y[ib].qs[j];
+        }
+
+        sumf += d * (float) sumi;
+    }
+
+    *s = sumf;
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -246,6 +483,20 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
 #else
         .nrows                    = 1,
 #endif
+    },
+    [GGML_TYPE_Q4_0_ROCMI4] = {
+        .from_float               = rocmfpx_quantize_row_i4,
+        .vec_dot                  = ggml_vec_dot_rocmi4_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q4_0_SYM4] = {
+        .from_float               = rocmfpx_quantize_row_sym4,
+        .vec_dot                  = ggml_vec_dot_sym4_q8_1,
+        // Q8_1 rather than Q8_0: the (n+0.5) grid needs sum_i m_i for its epilogue
+        // correction, and block_q8_1.s carries exactly that.
+        .vec_dot_type             = GGML_TYPE_Q8_1,
+        .nrows                    = 1,
     },
     [GGML_TYPE_Q4_1] = {
         .from_float               = quantize_row_q4_1,
@@ -294,6 +545,33 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_nvfp4,
         .vec_dot                  = ggml_vec_dot_nvfp4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_MXFP8] = {
+        .from_float               = quantize_row_mxfp8,
+        .vec_dot                  = ggml_vec_dot_mxfp8_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_MXFP6] = {
+        .from_float               = quantize_row_mxfp6,
+        .vec_dot                  = ggml_vec_dot_mxfp6_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_MXFP4_E4M3] = {
+        .from_float               = quantize_row_mxfp4_e4m3,
+        .vec_dot                  = ggml_vec_dot_mxfp4_e4m3_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    // F8 is a KV-cache-only type: no matmul weights, but the CPU flash-attention kernel needs a
+    // vec_dot for its K side (V goes through to_float). Q stays f16, mirroring the GPU side where
+    // F8 attention also runs through the f16 kernel.
+    [GGML_TYPE_F8] = {
+        .from_float               = quantize_row_f8,
+        .vec_dot                  = ggml_vec_dot_f8_f16,
+        .vec_dot_type             = GGML_TYPE_F16,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K] = {
@@ -1305,7 +1583,7 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
-    if (src1_cont) {
+    if (!params->use_ref && src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
@@ -1334,9 +1612,11 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
-        // the F16 path below writes plain floats into wdata, so it needs an F32 vec_dot_type
-        GGML_ASSERT(src1->type == GGML_TYPE_F32 || vec_dot_type == GGML_TYPE_F32);
+        // src1 is either packed from F32 into vec_dot_type, or widened from F16 or BF16 into the F32 work buffer
+        const bool widen = src1->type != GGML_TYPE_F32;
+
+        GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
+        GGML_ASSERT(!widen || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
     #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1349,20 +1629,24 @@ UseGgmlGemm1:;
             }
         }
     #else
+        const int64_t bs = ggml_blck_size(vec_dot_type);
+
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    const char * src1_block = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
-                    char * dst_block = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
-                    const int64_t n_block = (ne10_block_end - ne10_block_start) * bs;
+                    const void * src1_row  = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
+                    void       * wdata_row =                    wdata  + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
 
-                    if (src1->type == GGML_TYPE_F32) {
-                        from_float((const float *) src1_block, dst_block, n_block);
+                    const int64_t ne10_block_size = (ne10_block_end - ne10_block_start) * bs;
+
+                    if (src1->type == GGML_TYPE_F16) {
+                        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, (float *) wdata_row, ne10_block_size);
+                    } else if (src1->type == GGML_TYPE_BF16) {
+                        ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, (float *) wdata_row, ne10_block_size);
                     } else {
-                        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_block, (float *) dst_block, n_block);
+                        from_float((const float *) src1_row, wdata_row, ne10_block_size);
                     }
                 }
             }
@@ -1378,7 +1662,7 @@ UseGgmlGemm1:;
     ggml_barrier(params->threadpool);
 
 #if GGML_USE_LLAMAFILE
-    if (src1->type != vec_dot_type) {
+    if (!params->use_ref && src1->type != vec_dot_type) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 

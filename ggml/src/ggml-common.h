@@ -112,6 +112,18 @@ typedef sycl::half2 ggml_half2;
 #define QI_NVFP4 (QK_NVFP4 / (4 * QR_NVFP4))
 #define QR_NVFP4 2
 
+#define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
+#define QR_MXFP8 1
+
+#define QI_MXFP6 (QK_MXFP6 / (4 * QR_MXFP6))
+#define QR_MXFP6 1
+
+#define QI_MXFP4_E4M3 (QK_MXFP4_E4M3 / (4 * QR_MXFP4_E4M3))
+#define QR_MXFP4_E4M3 2
+
+#define QI_F8 (QK_F8 / (4 * QR_F8))
+#define QR_F8 1
+
 #define QI5_0 (QK5_0 / (4 * QR5_0))
 #define QR5_0 2
 
@@ -218,6 +230,18 @@ typedef struct {
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
 
+// MXFP4 with a block scale that is not restricted to powers of two: same 32 packed E2M1
+// nibbles, but the one scale per block is a UE4M3 instead of an E8M0. E8M0 can only land on
+// the powers of two, so it wastes range whenever amax sits between them; UE4M3's three
+// mantissa bits let the scale track amax, which measured 23% lower NMSE for the same 8 bits
+// of scale. Layout matches block_mxfp4 (17 bytes) so the loaders stay dword-friendly.
+#define QK_MXFP4_E4M3 32
+typedef struct {
+    uint8_t e; // UE4M3
+    uint8_t qs[QK_MXFP4_E4M3/2];
+} block_mxfp4_e4m3;
+static_assert(sizeof(block_mxfp4_e4m3) == sizeof(uint8_t) + QK_MXFP4_E4M3/2, "wrong mxfp4_e4m3 block size/padding");
+
 #define QK_NVFP4 64
 #define QK_NVFP4_SUB 16  // sub-block size for per-group scales
 typedef struct {
@@ -225,6 +249,36 @@ typedef struct {
     uint8_t qs[QK_NVFP4/2];           // packed 4-bit E2M1 values (32 bytes)
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
+
+// MXFP8 (OCP MX block-scaled FP8): E4M3 quants with one E8M0 scale per 32-element sub-block
+#define QK_MXFP8 256
+#define QK_MXFP8_SUB 32
+typedef struct {
+    uint8_t qs[QK_MXFP8 / QK_MXFP8_SUB][QK_MXFP8_SUB]; // E4M3 quants (256 bytes)
+    uint8_t e[QK_MXFP8 / QK_MXFP8_SUB];                 // E8M0 scales (8 bytes)
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == QK_MXFP8 + sizeof(uint8_t)*(QK_MXFP8/QK_MXFP8_SUB), "wrong mxfp8 block size/padding");
+
+// MXFP6 (OCP MX block-scaled FP6 E2M3): one E8M0 scale per 32-element sub-block, like MXFP8.
+// 32 codes pack into 24 bytes (6 bits each, code j at bit 6*j), so a 256-element super-block
+// is 8*24 + 8 = 200 bytes = 6.25 bpw. Same sub-block shape as MXFP8, so the HIP W8A8 fp8
+// WMMA path can consume it after a 6 -> 8 bit expansion of the quants.
+#define QK_MXFP6 256
+#define QK_MXFP6_SUB 32
+typedef struct {
+    uint8_t qs[QK_MXFP6 / QK_MXFP6_SUB][QK_MXFP6_SUB * 6 / 8]; // packed E2M3 codes (192 bytes)
+    uint8_t e[QK_MXFP6 / QK_MXFP6_SUB];                        // E8M0 scales (8 bytes)
+} block_mxfp6;
+static_assert(sizeof(block_mxfp6) == 6*QK_MXFP6/8 + sizeof(uint8_t)*(QK_MXFP6/QK_MXFP6_SUB), "wrong mxfp6 block size/padding");
+
+// F8: E4M3 quants with one F16 scale per 32-element group (Q8_0-shaped, KV-cache only).
+// 8.5 bpw; the 32-elem group matches the fp8 WMMA K=32 tile (one scale per mma group).
+#define QK_F8 32
+typedef struct {
+    ggml_half d;          // scale (f16)
+    uint8_t qs[QK_F8];    // 32 E4M3 quants
+} block_f8;
+static_assert(sizeof(block_f8) == sizeof(ggml_half) + QK_F8, "wrong f8 block size/padding");
 
 #define QK5_0 32
 typedef struct {
@@ -1127,6 +1181,62 @@ GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
 #define kvalues_mxfp4 kvalues_fp4
+
+// ROCmFP4 uses an E2M1-derived value set with the largest level retuned from
+// 12 to 10, plus dual half-block UE4M3 scales. Keeping this separate from
+// MXFP4 lets the experimental Strix Halo format evolve without changing stock
+// MXFP4/NVFP4 behavior.
+GGML_TABLE_BEGIN(int8_t, kvalues_rocmfp4, 16)
+    0, 1, 2, 3, 4, 6, 8, 10, 0, -1, -2, -3, -4, -6, -8, -10,
+GGML_TABLE_END()
+
+// e2m3 values (multiplied by 8), bit 5 = sign, bits 4:3 = exp (bias 1), bits 2:0 = mantissa
+GGML_TABLE_BEGIN(int8_t, kvalues_mxfp6_e2m3, 64)
+     0,   1,   2,   3,   4,   5,   6,   7,
+     8,   9,  10,  11,  12,  13,  14,  15,
+    16,  18,  20,  22,  24,  26,  28,  30,
+    32,  36,  40,  44,  48,  52,  56,  60,
+     0,  -1,  -2,  -3,  -4,  -5,  -6,  -7,
+    -8,  -9, -10, -11, -12, -13, -14, -15,
+   -16, -18, -20, -22, -24, -26, -28, -30,
+   -32, -36, -40, -44, -48, -52, -56, -60,
+GGML_TABLE_END()
+
+// e2m3 code -> e4m3 byte. Every e2m3 magnitude lies exactly on the e4m3 grid, so this
+// expansion loses nothing and lets the fp8 WMMA path run on mxfp6 weights unchanged.
+GGML_TABLE_BEGIN(uint8_t, kvalues_mxfp6_e4m3, 64)
+    0x00, 0x20, 0x28, 0x2c, 0x30, 0x32, 0x34, 0x36,
+    0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
+    0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+    0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f,
+    0x80, 0xa0, 0xa8, 0xac, 0xb0, 0xb2, 0xb4, 0xb6,
+    0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
+    0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,
+    0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf,
+GGML_TABLE_END()
+
+#if defined(GGML_COMMON_IMPL_C)
+// E4M3 values (without sign, index = e4m3 bits & 0x7F) scaled by 512 for fixed-point accumulation
+// dequant: value = sign * GGML_E8M0_TO_FP32(e) * (1/512) * kvalues_mxfp8[qs & 0x7F]
+GGML_TABLE_BEGIN(int32_t, kvalues_mxfp8, 128)
+    0, 1, 2, 3, 4, 5, 6, 7,
+    8, 9, 10, 11, 12, 13, 14, 15,
+    16, 18, 20, 22, 24, 26, 28, 30,
+    32, 36, 40, 44, 48, 52, 56, 60,
+    64, 72, 80, 88, 96, 104, 112, 120,
+    128, 144, 160, 176, 192, 208, 224, 240,
+    256, 288, 320, 352, 384, 416, 448, 480,
+    512, 576, 640, 704, 768, 832, 896, 960,
+    1024, 1152, 1280, 1408, 1536, 1664, 1792, 1920,
+    2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840,
+    4096, 4608, 5120, 5632, 6144, 6656, 7168, 7680,
+    8192, 9216, 10240, 11264, 12288, 13312, 14336, 15360,
+    16384, 18432, 20480, 22528, 24576, 26624, 28672, 30720,
+    32768, 36864, 40960, 45056, 49152, 53248, 57344, 61440,
+    65536, 73728, 81920, 90112, 98304, 106496, 114688, 122880,
+    131072, 147456, 163840, 180224, 196608, 212992, 229376, 0,
+GGML_TABLE_END()
+#endif // GGML_COMMON_IMPL_C
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f

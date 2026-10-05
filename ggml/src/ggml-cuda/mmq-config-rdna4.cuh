@@ -89,6 +89,48 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q8_0, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q8_0, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
 
+    // MXFP8: W8A8 fp8 WMMA. SRAM layout identical to Q8_0 (raw fp8 bytes + float scales).
+    CASE(GGML_TYPE_MXFP8, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP8, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP8, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP8, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP8, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP8, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP8, 128, 2,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP8, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP8, 256, 2, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP8, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP8, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP8, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+
+    // MXFP6: same W8A8 fp8 WMMA path as MXFP8 (the 6-bit codes expand to e4m3 at tile load).
+    CASE(GGML_TYPE_MXFP6, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP6, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP6, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP6, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP6, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP6, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP6, 128, 2,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP6, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP6, 256, 2, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP6, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP6, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP6, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+
+    // MXFP4_E4M3: same geometry as MXFP4 (32 elems, 17 B blocks) on the fp8 WMMA path.
+    CASE(GGML_TYPE_MXFP4_E4M3, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP4_E4M3, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP4_E4M3, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP4_E4M3, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_MXFP4_E4M3, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP4_E4M3, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP4_E4M3, 128, 2,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP4_E4M3, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP4_E4M3, 256, 2, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP4_E4M3, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP4_E4M3, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_MXFP4_E4M3, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
+
 // ---------------------------------------------------------------------------------------------
 
     CASE(GGML_TYPE_Q2_K, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K, MMQ_ITER_K, false, true);
@@ -291,5 +333,130 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_NVFP4, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_NVFP4, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4, MMQ_ITER_K, false, false);
 
-    return ggml_cuda_mmq_config(GGML_TYPE_COUNT, 256, 2, 128, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, 256, false, true);
+    
+// ROCmFPX / ROCmFP4 / ROCmI4 (same sram layouts as the types they mirror)
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,16,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,true);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,16,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,true);
+        #endif
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,32,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,true);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,32,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,true);
+        #endif
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,64,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,true);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,64,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,true);
+        #endif
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,128,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,true);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,128,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,true);
+        #endif
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,16,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,false);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,16,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,false);
+        #endif
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,32,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,false);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,32,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,false);
+        #endif
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,48,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,false);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,48,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,false);
+        #endif
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,64,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,false);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,64,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,false);
+        #endif
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,80,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,false);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,80,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,false);
+        #endif
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,96,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,false);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,96,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,false);
+        #endif
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,112,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,false);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,112,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,false);
+        #endif
+        #if GGML_ROCMI4_W4A4 // ROCMI4_W4A4_CONFIG: native i4 W4A4 (J % 16 == 0 only)
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 128,2,64,128,GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4,MMQ_ITER_K,false,false);
+        #else
+        CASE(GGML_TYPE_Q4_0_ROCMI4, 256,2,128,128,GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,MMQ_ITER_K,false,false);
+        #endif
+    // Q4_0_SYM4: identical block and tile layout to Q4_0_ROCMI4, so it reuses ROCMI4's
+    // SRAM layouts and tile geometry; only the loaders and the W4A4 vec_dot are its own.
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, true);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+        #endif
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, true);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+        #endif
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, true);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+        #endif
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, true);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+        #endif
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, false);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+        #endif
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, false);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+        #endif
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, false);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+        #endif
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, false);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 128, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+        #endif
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 256, 2, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, false);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 256, 2, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+        #endif
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, false);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+        #endif
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, false);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+        #endif
+        #if GGML_ROCMI4_W4A4
+        CASE(GGML_TYPE_Q4_0_SYM4, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_ROCMI4_W4A4, MMQ_ITER_K, false, false);
+        #else
+        CASE(GGML_TYPE_Q4_0_SYM4, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+        #endif
+
+return ggml_cuda_mmq_config(GGML_TYPE_COUNT, 256, 2, 128, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, 256, false, true);
 }

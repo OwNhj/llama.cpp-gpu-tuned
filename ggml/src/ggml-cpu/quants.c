@@ -62,6 +62,55 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void quantize_row_mxfp8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp8_ref(x, (block_mxfp8 *) y, k);
+}
+
+void quantize_row_mxfp6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp6_ref(x, (block_mxfp6 *) y, k);
+}
+
+void quantize_row_mxfp4_e4m3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_mxfp4_e4m3_ref(x, (block_mxfp4_e4m3 *) y, k);
+}
+
+void quantize_row_f8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_f8_ref(x, (block_f8 *) y, k);
+}
+
+// F8 x f16 dot product, used by the CPU flash-attention path: its K side has to go through a
+// vec_dot (unlike V, which uses to_float), so a KV type without one makes FA abort. Decoding the
+// e4m3 quants to f16 and reusing the f16 dot keeps this consistent with the GPU side, where F8
+// attention also runs through the f16 kernel.
+void ggml_vec_dot_f8_f16(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_F8 == 0);
+
+    const block_f8 * GGML_RESTRICT x = vx;
+    const ggml_fp16_t * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_F8;
+
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[ib].d);
+
+        for (int j = 0; j < QK_F8; ++j) {
+            const uint8_t q = x[ib].qs[j];
+            // same decode as dequantize_row_f8: sign * kvalues_mxfp8[q & 0x7F] / 512 * d
+            const float xv = ((q & 0x80) ? -1.0f : 1.0f) * (float) kvalues_mxfp8[q & 0x7F] * (1.0f / 512.0f) * d;
+            sumf += xv * GGML_CPU_FP16_TO_FP32(y[ib * QK_F8 + j]);
+        }
+    }
+
+    *s = sumf;
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -358,6 +407,111 @@ void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 
             sumf += dy * d * (sumi_lo + sumi_hi);
         }
+    }
+    *s = sumf;
+}
+
+// MXFP8: super-block of 256 elements = 8 sub-blocks of 32 = 8 q8_0 blocks
+void ggml_vec_dot_mxfp8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP8 == 0);
+    static_assert(QK_MXFP8_SUB == QK8_0, "QK_MXFP8_SUB and QK8_0 must be the same");
+
+    const block_mxfp8 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_MXFP8;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int s_idx = 0; s_idx < QK_MXFP8 / QK_MXFP8_SUB; ++s_idx) {
+            const float d = GGML_E8M0_TO_FP32(x[ib].e[s_idx]) * (1.0f / 512.0f) * GGML_CPU_FP16_TO_FP32(y[ib * (QK_MXFP8 / QK8_0) + s_idx].d);
+            const uint8_t * qx = x[ib].qs[s_idx];
+            const int8_t  * qy = y[ib * (QK_MXFP8 / QK8_0) + s_idx].qs;
+
+            int sumi = 0;
+            for (int j = 0; j < QK_MXFP8_SUB; ++j) {
+                const int sign = (qx[j] & 0x80) ? -1 : 1;
+                sumi += qy[j] * (sign * (int) kvalues_mxfp8[qx[j] & 0x7F]);
+            }
+            sumf += d * sumi;
+        }
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_mxfp6_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP6 == 0);
+    static_assert(QK_MXFP6_SUB == QK8_0, "QK_MXFP6_SUB and QK8_0 must be the same");
+
+    const block_mxfp6 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_MXFP6;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int s_idx = 0; s_idx < QK_MXFP6 / QK_MXFP6_SUB; ++s_idx) {
+            const float d = GGML_E8M0_TO_FP32(x[ib].e[s_idx]) * (1.0f / 8.0f) * GGML_CPU_FP16_TO_FP32(y[ib * (QK_MXFP6 / QK8_0) + s_idx].d);
+            const int8_t  * qy = y[ib * (QK_MXFP6 / QK8_0) + s_idx].qs;
+
+            const uint8_t * qs = x[ib].qs[s_idx];
+            int sumi = 0;
+            for (int j = 0; j < QK_MXFP6_SUB; ++j) {
+                const int bit = 6*j;
+                const int byte = bit >> 3;
+                const int shift = bit & 7;
+                uint32_t w = qs[byte];
+                if (shift > 2) {
+                    w |= (uint32_t) qs[byte + 1] << 8;
+                }
+                sumi += qy[j] * (int) kvalues_mxfp6_e2m3[(w >> shift) & 0x3F];
+            }
+            sumf += d * sumi;
+        }
+    }
+    *s = sumf;
+}
+
+// MXFP4_E4M3: same 16 packed E2M1 nibbles per block as MXFP4, only the scale codec differs.
+void ggml_vec_dot_mxfp4_e4m3_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_MXFP4_E4M3 == 0);
+    static_assert(QK_MXFP4_E4M3 == QK8_0, "QK_MXFP4_E4M3 and QK8_0 must be the same");
+
+    const block_mxfp4_e4m3 * GGML_RESTRICT x = vx;
+    const block_q8_0        * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_MXFP4_E4M3;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = ggml_ue4m3_to_fp32(x[ib].e) * GGML_CPU_FP16_TO_FP32(y[ib].d);
+        const int8_t * GGML_RESTRICT qy = y[ib].qs;
+
+        int sumi = 0;
+        for (int j = 0; j < QK_MXFP4_E4M3/2; ++j) {
+            const int q = x[ib].qs[j];
+            sumi += qy[j]              * (int) kvalues_mxfp4[q & 0x0F];
+            sumi += qy[j + QK_MXFP4_E4M3/2] * (int) kvalues_mxfp4[q >>   4];
+        }
+        sumf += d * sumi;
     }
     *s = sumf;
 }
