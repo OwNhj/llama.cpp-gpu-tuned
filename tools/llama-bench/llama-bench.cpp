@@ -521,6 +521,12 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "f8") {
         return GGML_TYPE_F8;
     }
+    if (s == "mxfp4") {
+        return GGML_TYPE_MXFP4;
+    }
+    if (s == "nvfp4") {
+        return GGML_TYPE_NVFP4;
+    }
 
     return GGML_TYPE_COUNT;
 }
