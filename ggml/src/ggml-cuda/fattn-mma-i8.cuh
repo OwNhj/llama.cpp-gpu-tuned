@@ -136,7 +136,7 @@ static __global__ void flash_attn_ext_i8(
     int   * sK     = (int   *) (sQd    + 16*n_kv_groups);
     float * sKd    = (float *) (sK     + n_kv_bufs*nbatch_fa*(DKQ/4));
     half2 * sVf    = (half2 *) (sKd    + n_kv_bufs*nbatch_fa*n_kv_groups);
-    float * sScale = (float *) (sVf    + (size_t)n_kv_bufs*DV*(nbatch_fa/2));
+    float * sScale = (float *) (sVf    + (size_t)1*DV*(nbatch_fa/2));  // sVf is single-buffered
     float * sRowsum= (float *) (sScale + 16);
 
     // K/V base for this (z_KV, sequence)
@@ -245,7 +245,6 @@ static __global__ void flash_attn_ext_i8(
     auto load_KV = [&](const int buf, const int k0) {
         int   * sK_buf  = sK  + (size_t)buf*nbatch_fa*(DKQ/4);
         float * sKd_buf = sKd + (size_t)buf*nbatch_fa*n_kv_groups;
-        half2 * sVf_buf = sVf + (size_t)buf*DV*(nbatch_fa/2);
 
         {
             constexpr int ints_per_group = 32/4;         // 8 int columns per block_q8_0 group
@@ -275,9 +274,14 @@ static __global__ void flash_attn_ext_i8(
             const int seq_k = k0 + s;
             sKd_buf[idx] = (seq_k < n_pos_kv) ? __half2float(K0[seq_k*nb11_blk + g].d) : 0.0f;
         }
-        // V: q8_0 dequant to f16. One block_q8_0 group = 32 consecutive int8 head_out values
-        // plus one f16 scale; each work item decodes a whole (group, seq pair). int8 -> f32 is
-        // a plain integer widening (no fp conversion table needed), then narrow to f16.
+    };
+
+    // V dequant to f16 (single-buffered, done after the KQ mma of the same tile so the
+    // global->LDS V traffic overlaps with the softmax math instead of occupying SRAM for
+    // two tiles: the V tile at 32KB/buf was forcing 54KB SRAM and limiting the SM to one
+    // single-warp block).
+    auto load_V = [&](const int k0) {
+        half2 * sVf_buf = sVf;
         {
             constexpr int n_grp  = DV/32;          // vscale groups per row
             constexpr int n_seq2 = nbatch_fa/2;    // half2 columns (2 seq each)
@@ -324,11 +328,11 @@ static __global__ void flash_attn_ext_i8(
 
         int   * sK_cur  = sK  + (size_t)cur*nbatch_fa*(DKQ/4);
         float * sKd_cur = sKd + (size_t)cur*nbatch_fa*n_kv_groups;
-        half2 * sVf_cur = sVf + (size_t)cur*DV*(nbatch_fa/2);
-
         if (it + 1 < n_iters) {
             load_KV(nxt, (it + 1)*nbatch_fa);
         }
+        load_V(k0);
+        __syncthreads();
 
         // ---- KQ matmul: S (16 seq_q x 32 seq) = sum_g dQ[row] * dK[seq][g] * (Q_g . K_g^T) ----
         // The int mma overload computes one 16-wide head chunk (2x iu8 wmma, K=16 each); two
@@ -461,7 +465,7 @@ static __global__ void flash_attn_ext_i8(
                 T_A_VKQ V_A;
                 // Each sh group covers 16 seq = 8 half2 columns of the sVf row; the offset must
                 // NOT be derived from nbatch_fa (nbatch_fa/4 happens to equal 8 only when it is 32).
-                load_ldmatrix(V_A, sVf_cur + oh*16*(nbatch_fa/2) + sh*8, nbatch_fa/2);
+                load_ldmatrix(V_A, sVf + oh*16*(nbatch_fa/2) + sh*8, nbatch_fa/2);
                 // mma convention: D = B x A^T  ->  D[m][n] = B[m]*A[n]
                 // want O[m=head_out][n=seq_q] = V[m]*P[n]  =>  A=P, B=V
                 mma(O, P_B[sh], V_A);   // f16 mma (16-row, f32 C)
@@ -528,7 +532,7 @@ static void ggml_cuda_flash_attn_ext_mma_i8_case_impl(ggml_backend_cuda_context 
       + 16*(DKQ/32)*(size_t)sizeof(float)        // sQd   (per row, per 32-group)
       + 2*32*(DKQ/4)*(size_t)sizeof(int)        // sK    x2 buffers (nbatch_fa = 32)
       + 2*32*(DKQ/32)*(size_t)sizeof(float)     // sKd   x2 buffers (nbatch_fa = 32)
-      + (size_t)2*DV*16*sizeof(half2)           // sVf   x2 buffers (nbatch_fa/2 = 16)
+      + (size_t)1*DV*16*sizeof(half2)           // sVf   single buffer (nbatch_fa/2 = 16)
       + 32*sizeof(float);                       // sScale[16] + sRowsum[16]
 
     float scale;
