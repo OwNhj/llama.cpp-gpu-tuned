@@ -224,8 +224,13 @@ static __global__ void dequantize_block_iq1_m(const void * __restrict__ vx, dst_
 }
 
 template<typename dst_t>
-static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
     const int64_t i = blockIdx.x;
+
+    const int64_t ib = 8*i + threadIdx.x%8;
+    if (ib >= nb32) {
+        return;
+    }
 
     dequantize_iq4_nl(vx, i, yy + i*QK_K, threadIdx.x);
 }
@@ -392,8 +397,9 @@ static void dequantize_row_iq1_s_cuda(const void * vx, dst_t * y, const int64_t 
 
 template<typename dst_t>
 static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb32 = k / QK4_NL;
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y, nb32);
 }
 
 template<typename dst_t>
@@ -427,54 +433,9 @@ static void dequantize_row_mxfp4_e4m3_cuda(const void * vx, dst_t * y, const int
     dequantize_block_mxfp4_e4m3<<<nb, 32, 0, stream>>>(vx, y);
 }
 
-template<typename dst_t>
-static __global__ void dequantize_block_rocmfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-
-    const int64_t i   = blockIdx.x;
-    const block_rocmfp4 * x = (const block_rocmfp4 *) vx + i*(QK_K/QK_ROCMFP4);
-
-    const int64_t tid = threadIdx.x;
-    const int64_t il = tid/8; // 0...3
-    const int64_t ib = tid%8; // 0...7
-    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
-    const uint8_t * q4 = x[ib].qs + 4*il;
-    const float d0 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[0]);
-    const float d1 = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e[1]);
-    for (int j = 0; j < 4; ++j) {
-        y[j+ 0] = d0 * rocmfp4_decode_i8(q4[j]);
-        y[j+16] = d1 * rocmfp4_decode_i8(q4[j] >>  4);
-    }
-}
-
-template<typename dst_t>
-static __global__ void dequantize_block_rocmfp4_fast(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-
-    const int64_t i = blockIdx.x;
-    const block_rocmfp4_fast * x = (const block_rocmfp4_fast *) vx + i*(QK_K/QK_ROCMFP4);
-
-    const int64_t tid = threadIdx.x;
-    const int64_t il = tid/8; // 0...3
-    const int64_t ib = tid%8; // 0...7
-    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
-    const uint8_t * q4 = x[ib].qs + 4*il;
-    const float d = rocmfp4_ue4m3_to_fp32_half_finite(x[ib].e);
-    for (int j = 0; j < 4; ++j) {
-        y[j+ 0] = d * rocmfp4_decode_i8(q4[j]);
-        y[j+16] = d * rocmfp4_decode_i8(q4[j] >>  4);
-    }
-}
-
-template<typename dst_t>
-static void dequantize_row_rocmfp4_hip(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_rocmfp4<<<nb, 32, 0, stream>>>(vx, y);
-}
-
-template<typename dst_t>
-static void dequantize_row_rocmfp4_fast_hip(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_rocmfp4_fast<<<nb, 32, 0, stream>>>(vx, y);
-}
+// NOTE: the ROCMFP4 / ROCMFP4_FAST dequantize kernels and their launchers were removed:
+// the ROCMFP family was dropped and the only references left were unreachable `return`
+// statements from deleted case labels, which also force-instantiated these templates.
 
 template <typename dst_t>
 static __global__ void dequantize_block_nvfp4(
@@ -639,12 +600,6 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_MXFP4_E4M3:
             return dequantize_row_mxfp4_e4m3_cuda;
-            return dequantize_row_rocmfp4_hip;
-            return dequantize_row_rocmfp4_fast_hip;
-            return dequantize_block_cont_cuda<QK_ROCMFP2, QR_ROCMFP2, dequantize_rocmfpx_fp2>;
-            return dequantize_block_cont_cuda<QK_ROCMFP3, QR_ROCMFP3, dequantize_rocmfpx_fp3>;
-            return dequantize_block_cont_cuda<QK_ROCMFP6, QR_ROCMFP6, dequantize_rocmfpx_fp6>;
-            return dequantize_block_cont_cuda<QK_ROCMFP8, QR_ROCMFP8, dequantize_rocmfpx_fp8>;
         case GGML_TYPE_Q4_0_ROCMI4:
             return dequantize_block_cont_cuda<QK_ROCMI4, QR_ROCMI4, dequantize_rocmi4>;
         case GGML_TYPE_Q4_0_SYM4:
@@ -713,12 +668,6 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_MXFP4_E4M3:
             return dequantize_row_mxfp4_e4m3_cuda;
-            return dequantize_row_rocmfp4_hip;
-            return dequantize_row_rocmfp4_fast_hip;
-            return dequantize_block_cont_cuda<QK_ROCMFP2, QR_ROCMFP2, dequantize_rocmfpx_fp2>;
-            return dequantize_block_cont_cuda<QK_ROCMFP3, QR_ROCMFP3, dequantize_rocmfpx_fp3>;
-            return dequantize_block_cont_cuda<QK_ROCMFP6, QR_ROCMFP6, dequantize_rocmfpx_fp6>;
-            return dequantize_block_cont_cuda<QK_ROCMFP8, QR_ROCMFP8, dequantize_rocmfpx_fp8>;
         case GGML_TYPE_Q4_0_ROCMI4:
             return dequantize_block_cont_cuda<QK_ROCMI4, QR_ROCMI4, dequantize_rocmi4>;
         case GGML_TYPE_Q4_0_SYM4:
@@ -784,12 +733,6 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_MXFP4_E4M3:
             return dequantize_row_mxfp4_e4m3_cuda;
-            return dequantize_row_rocmfp4_hip;
-            return dequantize_row_rocmfp4_fast_hip;
-            return dequantize_block_cont_cuda<QK_ROCMFP2, QR_ROCMFP2, dequantize_rocmfpx_fp2>;
-            return dequantize_block_cont_cuda<QK_ROCMFP3, QR_ROCMFP3, dequantize_rocmfpx_fp3>;
-            return dequantize_block_cont_cuda<QK_ROCMFP6, QR_ROCMFP6, dequantize_rocmfpx_fp6>;
-            return dequantize_block_cont_cuda<QK_ROCMFP8, QR_ROCMFP8, dequantize_rocmfpx_fp8>;
         case GGML_TYPE_Q4_0_ROCMI4:
             return dequantize_block_cont_cuda<QK_ROCMI4, QR_ROCMI4, dequantize_rocmi4>;
         case GGML_TYPE_Q4_0_SYM4:

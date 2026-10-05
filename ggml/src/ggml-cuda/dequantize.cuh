@@ -263,11 +263,13 @@ static __device__ __forceinline__ void dequantize_f8(const void * vx, const int6
 
     const float d = x[ib].d;
 
-    v.x = (x[ib].qs[iqs + 0] & 0x80 ? -1.0f : 1.0f) * ggml_cuda_ue4m3_to_fp32_raw(x[ib].qs[iqs + 0] & 0x7F);
-    v.y = (x[ib].qs[iqs + 1] & 0x80 ? -1.0f : 1.0f) * ggml_cuda_ue4m3_to_fp32_raw(x[ib].qs[iqs + 1] & 0x7F);
+    // Decode both bytes with one hardware instruction on RDNA4 (v_cvt_pk_f32_fp8) instead of
+    // two software ue4m3_raw() calls (which fall back to ldexpf on HIP). Same signed-e4m3
+    // convention and NaN -> 0 mapping as before.
+    const float2 e = ggml_cuda_e4m3x2_to_fp32(x[ib].qs[iqs + 0], x[ib].qs[iqs + 1]);
 
-    v.x *= d;
-    v.y *= d;
+    v.x = e.x * d;
+    v.y = e.y * d;
 }
 
 //================================== k-quants

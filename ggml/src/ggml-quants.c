@@ -419,6 +419,7 @@ static void quantize_row_mxfp4_impl(const float * GGML_RESTRICT x, block_mxfp4 *
         for (int j = 0; j < qk; j++) {
             amax = MAX(amax, fabsf(xb[j]));
         }
+        GGML_ASSERT(isfinite(amax));
 
         const uint8_t e0 = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
 
@@ -856,15 +857,19 @@ static uint8_t mxfp6_quantize_mag(float x) {
     if (!(x > 0.0f)) {
         return 0;
     }
+    // lrintf (round-to-nearest-even under the default FP rounding mode) instead of roundf
+    // (half-away): this matches the RTNE convention ggml_fp32_to_e4m3 uses for the other OCP
+    // formats and the Python quants.py argmin reference, so tie cases (e.g. 0.8125 in the
+    // e = 0 band, which sits exactly between codes 6 and 7) land consistently.
     int e, m;
     if (x < 1.0f) {
-        e = 0; m = (int) roundf(8.0f*x);
+        e = 0; m = (int) lrintf(8.0f*x);
     } else if (x < 2.0f) {
-        e = 1; m = (int) roundf(8.0f*(x - 1.0f));
+        e = 1; m = (int) lrintf(8.0f*(x - 1.0f));
     } else if (x < 4.0f) {
-        e = 2; m = (int) roundf(4.0f*(x - 2.0f));
+        e = 2; m = (int) lrintf(4.0f*(x - 2.0f));
     } else {
-        e = 3; m = (int) roundf(2.0f*(x - 4.0f));
+        e = 3; m = (int) lrintf(2.0f*(x - 4.0f));
     }
     if (m > 7) {
         m = 0;
@@ -1827,8 +1832,9 @@ static float make_qkx3_quants(int n, int nmax, const float * GGML_RESTRICT x, co
         iscale = (rmin + rdelta*is + nmax)/(max - min);
         float sum_l = 0, sum_l2 = 0, sum_xl = 0;
         for (int i = 0; i < n; ++i) {
-            int l = nearest_int(iscale*(x[i] - min));
-            l = MAX(0, MIN(nmax, l));
+            // min is the best fit so far and can be at or near max, so v can be inf, nan or out of range for nearest_int
+            const float v = iscale*(x[i] - min);
+            const int l = v > 0 ? nearest_int(MIN(v, nmax)) : 0;
             Laux[i] = l;
             float w = weights ? weights[i] : x[i]*x[i];
             sum_l  += w*l;
