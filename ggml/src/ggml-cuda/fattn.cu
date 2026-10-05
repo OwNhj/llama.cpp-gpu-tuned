@@ -2,6 +2,7 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-f8.cuh"
+#include "fattn-mma-i8.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -437,6 +438,7 @@ typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor *
 static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K, const ggml_type type_V) {
     FATTN_VEC_CASES_ALL_D(F8,   F8)
     FATTN_VEC_CASES_ALL_D(F8,   F16)
+    FATTN_VEC_CASES_ALL_D(Q8_0, F8)
     FATTN_VEC_CASES_ALL_D(F16,  F8)
     FATTN_VEC_CASES_ALL_D(F16,  F16)
     FATTN_VEC_CASES_ALL_D(Q4_0, F16)
@@ -524,6 +526,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
     BEST_FATTN_KERNEL_MMA_F8  = 500,
+    BEST_FATTN_KERNEL_MMA_I8  = 600,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -538,6 +541,8 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_F8:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
             return true;
         default:
             return false;
@@ -719,6 +724,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 K->type == GGML_TYPE_F8 && V->type == GGML_TYPE_F8 && (Q->ne[0] == 96 || Q->ne[0] == 128)) {
             return BEST_FATTN_KERNEL_MMA_F8;
         }
+        // Native i8 FA for Q8_0 KV (RDNA4): QK^T on iu8 WMMA (Q quantized in-kernel), V dequants
+        // to f16 in SRAM. Ignores sinks (mirror of the f8 kernel).
+        if (getenv("I8_NATIVE") != nullptr && sinks == nullptr &&
+                K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+                (Q->ne[0] == 96 || Q->ne[0] == 128 || Q->ne[0] == 256)) {
+            return BEST_FATTN_KERNEL_MMA_I8;
+        }
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
@@ -764,6 +776,37 @@ static void ggml_cuda_flash_attn_ext_mma_f8(ggml_backend_cuda_context & ctx, ggm
     }
 }
 
+static void ggml_cuda_flash_attn_ext_mma_i8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV = dst;
+    const ggml_tensor * Q   = dst->src[0];
+    const ggml_tensor * V   = dst->src[2];
+
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    const bool softcap = logit_softcap != 0.0f;
+
+    switch (Q->ne[0]) {
+        case 96:
+            GGML_ASSERT(V->ne[0] == 96);
+            if (softcap) { ggml_cuda_flash_attn_ext_mma_i8_case_impl<96, 96, true >(ctx, dst); }
+            else         { ggml_cuda_flash_attn_ext_mma_i8_case_impl<96, 96, false>(ctx, dst); }
+            break;
+        case 128:
+            GGML_ASSERT(V->ne[0] == 128);
+            if (softcap) { ggml_cuda_flash_attn_ext_mma_i8_case_impl<128, 128, true >(ctx, dst); }
+            else         { ggml_cuda_flash_attn_ext_mma_i8_case_impl<128, 128, false>(ctx, dst); }
+            break;
+        case 256:
+            GGML_ASSERT(V->ne[0] == 256);
+            if (softcap) { ggml_cuda_flash_attn_ext_mma_i8_case_impl<256, 256, true >(ctx, dst); }
+            else         { ggml_cuda_flash_attn_ext_mma_i8_case_impl<256, 256, false>(ctx, dst); }
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+}
+
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -787,6 +830,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
         case BEST_FATTN_KERNEL_MMA_F8:
             // native fp8 FA: K read raw as e4m3, V dequants in-kernel -> no f16 extra buffers
+            need_f16_K = false;
+            need_f16_V = false;
+            break;
+        case BEST_FATTN_KERNEL_MMA_I8:
+            // native i8 FA: K read raw as int8 (Q quantized in-kernel), V dequants in-kernel
             need_f16_K = false;
             need_f16_V = false;
             break;
@@ -821,6 +869,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F8:
             ggml_cuda_flash_attn_ext_mma_f8(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_I8:
+            ggml_cuda_flash_attn_ext_mma_i8(ctx, dst);
             break;
     }
 }
