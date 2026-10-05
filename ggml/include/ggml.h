@@ -438,8 +438,6 @@ extern "C" {
         // ROCmFPx experimental family (ported from the ROCmFPX fork, adapted to this MMQ).
         // Only Q4_0_ROCMI4 is exercised by the W4A4 path; the rest keep the fork numbering
         // so the ported sources compile unchanged.
-        GGML_TYPE_TURBO3_0          = 105, // TurboQuant 3-bit KV-cache (3.5 bpw)
-        GGML_TYPE_TURBO4_0          = 106, // TurboQuant 4-bit KV-cache (4.5 bpw)
         GGML_TYPE_Q4_0_ROCMI4       = 108, // native signed-nibble 4-bit + UE4M3 scale (no codebook)
         GGML_TYPE_Q4_0_SYM4         = 107, // same block, symmetric grid (n+0.5)*s -- no exact zero
         GGML_TYPE_COUNT   = 109,

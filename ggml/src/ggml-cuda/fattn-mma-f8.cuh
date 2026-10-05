@@ -32,17 +32,6 @@ static __device__ __forceinline__ int pack_e4m3_4(uint8_t b0, uint8_t b1, uint8_
     return (int)(b0) | ((int)(b1) << 8) | ((int)(b2) << 16) | ((int)(b3) << 24);
 }
 
-// Decode a SIGNED e4m3 byte to f32, exactly like dequantize_f8() in dequantize.cuh:
-//   value = (byte & 0x80 ? -1 : +1) * ue4m3_raw(byte & 0x7F)
-//
-// Do NOT call ggml_cuda_ue4m3_to_fp32_raw() on the raw byte: that helper decodes the unsigned
-// "ue4m3" variant and ignores bit 7, so every negative KV value would come out positive.
-// The F8 KV cache is written by quantize_f32_f8_block() with signed e4m3, and the fp8 WMMA
-// hardware reads the bytes as signed e4m3 as well, so the dequant must match that convention.
-static __device__ __forceinline__ float e4m3_to_fp32_signed(uint8_t x) {
-    return (x & 0x80 ? -1.0f : 1.0f) * ggml_cuda_ue4m3_to_fp32_raw(x & 0x7F);
-}
-
 // Two packed e4m3 bytes -> f32x2. ggml_cuda_e4m3x2_to_fp32() (common.cuh) is the shared
 // implementation: it uses the gfx12 hardware instruction and falls back to a portable software
 // decode elsewhere, and it follows the signed e4m3 convention the KV cache is written with.
@@ -263,8 +252,14 @@ static __global__ void flash_attn_ext_f8(
                 const int g   = idx / n_seq2;
                 const int sh2 = idx - g*n_seq2;
                 const int s0  = k0 + 2*sh2;
-                const block_f8 * blk0 = V0 + s0*nb21_blk + g;
-                const block_f8 * blk1 = blk0 + nb21_blk;      // seq s0+1
+                // Clamp out-of-range rows to a valid row before touching the pointers:
+                // blk1 (= seq s0+1) used to be dereferenced unconditionally by the memcpy
+                // below even when s0+1 >= n_pos_kv, which read past the end of the V tensor.
+                // The values are still masked by d0/d1 == 0, so the result is unchanged.
+                const int s0c = min(s0,     n_pos_kv - 1);
+                const int s1c = min(s0 + 1, n_pos_kv - 1);
+                const block_f8 * blk0 = V0 + s0c*nb21_blk + g;
+                const block_f8 * blk1 = V0 + s1c*nb21_blk + g;  // seq s0+1 (clamped)
                 const float d0 = (s0     < n_pos_kv) ? __half2float(blk0->d) : 0.0f;
                 const float d1 = (s0 + 1 < n_pos_kv) ? __half2float(blk1->d) : 0.0f;
                 // half2 = (seq s0, seq s0+1) for the same head_out, matching the ldmatrix row layout.
