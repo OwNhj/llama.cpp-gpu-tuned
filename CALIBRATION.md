@@ -34,7 +34,7 @@ llama-imatrix -m model-f16.gguf -f corpus.txt --hessian-dir hess/ \
 Writes per-tensor upper-triangle Hessians (f64) into `hess/` (~58 GB for
 Qwen3.8-27B at 24 chunks; single-GPU use `-ngl 99` with an f16-fitting model).
 Consumers: the GPTQ path below and offline coordinate-descent / OBS solvers
-(GSQ-style scripts live outside the tree, in `/media/seirin/SSD2T_1/hf/gsq/`).
+the GSQ solver side is in `scripts/gsq/` (see scripts/gsq/README.md).
 
 Corpus-shape rule learned the hard way: the effective calibration window is the
 **first `--chunks x 512` tokens** of `-f`. For multi-domain corpora, interleave
