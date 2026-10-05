@@ -548,20 +548,6 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         }
         return std::make_pair(i_layer, n_layer);
     };
-    auto layer_from_name = [&](const std::string & tensor_name, int n_layer) -> std::pair<int, int> {
-        int i_layer = 0;
-        if (sscanf(tensor_name.c_str(), "blk.%d.", &i_layer) == 1) {
-            return { i_layer, n_layer };
-        }
-        static std::mutex warn_mtx;
-        static std::unordered_set<std::string> warned;
-        std::lock_guard<std::mutex> lock(warn_mtx);
-        if (warned.emplace(tensor_name).second) {
-            LLAMA_LOG_WARN("%s: could not parse layer index from tensor '%s', assuming layer 0\n",
-                __func__, tensor_name.c_str());
-        }
-        return { 0, n_layer };
-    };
 
     // for arches that share the same tensor between the token embeddings and the output, we quantize the token embeddings
     // with the quantization of the output tensor

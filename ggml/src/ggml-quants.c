@@ -419,6 +419,7 @@ static void quantize_row_mxfp4_impl(const float * GGML_RESTRICT x, block_mxfp4 *
         for (int j = 0; j < qk; j++) {
             amax = MAX(amax, fabsf(xb[j]));
         }
+        GGML_ASSERT(isfinite(amax));
 
         const uint8_t e0 = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
 
@@ -783,15 +784,19 @@ static uint8_t mxfp6_quantize_mag(float x) {
     if (!(x > 0.0f)) {
         return 0;
     }
+    // lrintf (round-to-nearest-even under the default FP rounding mode) instead of roundf
+    // (half-away): this matches the RTNE convention ggml_fp32_to_e4m3 uses for the other OCP
+    // formats and the Python quants.py argmin reference, so tie cases (e.g. 0.8125 in the
+    // e = 0 band, which sits exactly between codes 6 and 7) land consistently.
     int e, m;
     if (x < 1.0f) {
-        e = 0; m = (int) roundf(8.0f*x);
+        e = 0; m = (int) lrintf(8.0f*x);
     } else if (x < 2.0f) {
-        e = 1; m = (int) roundf(8.0f*(x - 1.0f));
+        e = 1; m = (int) lrintf(8.0f*(x - 1.0f));
     } else if (x < 4.0f) {
-        e = 2; m = (int) roundf(4.0f*(x - 2.0f));
+        e = 2; m = (int) lrintf(4.0f*(x - 2.0f));
     } else {
-        e = 3; m = (int) roundf(2.0f*(x - 4.0f));
+        e = 3; m = (int) lrintf(2.0f*(x - 4.0f));
     }
     if (m > 7) {
         m = 0;

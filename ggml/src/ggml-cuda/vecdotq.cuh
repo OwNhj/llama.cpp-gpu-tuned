@@ -339,80 +339,10 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
 #define VDR_NVFP4_Q8_1_MMVQ 4
 #define VDR_NVFP4_Q8_1_MMQ  8
 
-static __device__ __forceinline__ uint32_t rocmfpx_get_bits_vec_cuda(const uint8_t * src, const int bit_pos, const int nbits) {
-    uint32_t code = 0;
-
-#pragma unroll
-    for (int bit = 0; bit < nbits; ++bit) {
-        const int src_bit = bit_pos + bit;
-        code |= ((uint32_t) ((src[src_bit >> 3] >> (src_bit & 7)) & 1u)) << bit;
-    }
-
-    return code;
-}
-
-static __device__ __forceinline__ int rocmfpx_decode_fp3_code_vec_cuda(const uint32_t code) {
-    const uint32_t mag_code = code & 3u;
-    const int mag = mag_code == 3u ? 4 : (int) mag_code;
-    return (code & 4u) ? -mag : mag;
-}
-
-static __device__ __forceinline__ int rocmfpx_pack4_fp2_vec_cuda(const uint8_t packed) {
-#if defined(GGML_USE_HIP)
-    // Spread the low and high code bits independently into the low bits of
-    // four byte selectors.  Separating the planes prevents carries between
-    // adjacent two-bit codes during the multiply.
-    constexpr uint32_t byte_lsb = 0x01010101u;
-    const uint32_t lo = (((uint32_t) packed        & 0x55u) * 0x00041041u) & byte_lsb;
-    const uint32_t hi = ((((uint32_t) packed >> 1) & 0x55u) * 0x00041041u) & byte_lsb;
-    const uint32_t selectors = lo | (hi << 1);
-
-    // v_perm_b32 selector bytes 0..3 choose bytes from the second operand.
-    // Packed little-endian table bytes are {-4, -1, +1, +4}.
-    return __builtin_amdgcn_perm(0u, 0x0401fffcu, selectors);
-#else
-    int result = 0;
-#pragma unroll
-    for (int lane = 0; lane < 4; ++lane) {
-        const uint32_t code = (packed >> (2 * lane)) & 3u;
-        const int value = code == 0u ? -4 : code == 1u ? -1 : code == 2u ? 1 : 4;
-        result |= ((int) (uint8_t) (int8_t) value) << (8 * lane);
-    }
-    return result;
-#endif
-}
-
-static __device__ __forceinline__ int rocmfpx_decode_fp6_code_vec_cuda(const uint32_t code) {
-}
-
-static __device__ __forceinline__ int rocmfpx_pack4_fp6_bits24_vec_cuda(const uint32_t bits24) {
-    const char4 v = make_char4(
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda(bits24 & 63u),
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda((bits24 >>  6) & 63u),
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda((bits24 >> 12) & 63u),
-        (int8_t) rocmfpx_decode_fp6_code_vec_cuda((bits24 >> 18) & 63u));
-    return *((const int *) &v);
-}
-
-static __device__ __forceinline__ int rocmfpx_pack4_fp3_vec_cuda(const uint8_t * qs, const int base) {
-    const char4 v = make_char4(
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 0)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 1)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 2)*3, 3)),
-        (int8_t) rocmfpx_decode_fp3_code_vec_cuda(rocmfpx_get_bits_vec_cuda(qs, (base + 3)*3, 3)));
-    return *((const int *) &v);
-}
-
-static __device__ __forceinline__ int rocmfpx_pack4_fp6_vec_cuda(const uint8_t * qs, const int base) {
-}
-
-static __device__ __forceinline__ int rocmfpx_pack4_fp6_expanded_vec_cuda(const int8_t * qs, const int base) {
-    const char4 v = make_char4(qs[base + 0], qs[base + 1], qs[base + 2], qs[base + 3]);
-    return *((const int *) &v);
-}
-
-static __device__ __forceinline__ int rocmfpx_pack4_fp6_device_vec_cuda(const block_rocmfp6_device * bq6, const int base) {
-}
+// NOTE: the ROCmFPX FP2/FP3/FP6 vec_dot helpers that used to live here were removed:
+// three of them (rocmfpx_decode_fp6_code_vec_cuda, rocmfpx_pack4_fp6_vec_cuda,
+// rocmfpx_pack4_fp6_device_vec_cuda) had empty non-void bodies (undefined behavior), and the
+// whole group had no call sites left after the ROCMFP family was dropped.
 
 static __device__ __forceinline__ int2 rocmi4_unpack_signed_nibbles(const int q4) {
     int even = q4 & 0x0F0F0F0F;

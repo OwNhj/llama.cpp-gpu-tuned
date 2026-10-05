@@ -169,9 +169,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
         case GGML_TYPE_IQ4_NL:  return 6;
         case GGML_TYPE_IQ4_XS:  return 5;
         case GGML_TYPE_MXFP4:   return 4;
-                                return 4;
-                                return 4;
         case GGML_TYPE_NVFP4:   return 4;
+        case GGML_TYPE_MXFP8:   return 4;
+        case GGML_TYPE_MXFP6:   return 4;
+        case GGML_TYPE_MXFP4_E4M3: return 4;
+        case GGML_TYPE_Q4_0_ROCMI4: return 4;
+        case GGML_TYPE_Q4_0_SYM4:   return 4;
         case GGML_TYPE_Q2_K:    return 4;
         case GGML_TYPE_Q3_K:    return 4;
         case GGML_TYPE_Q4_0:    return 6;

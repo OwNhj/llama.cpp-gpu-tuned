@@ -92,36 +92,36 @@ static __device__ __forceinline__ float rocmfp4_u32_as_f32(uint32_t bits) {
 // ROCmFP4 validates scale bytes before backend execution, so HIP/ROCm hot
 // paths can decode finite unsigned E4M3 half-scales directly without the
 // generic FP8 NaN handling used by other formats.
+//
+// The non-LUT path is written branchlessly: a data-dependent `if (exp == 0)` here
+// diverges across blocks (many sit in the subnormal range, many do not) and both
+// sides end up executing, which measured as a real prefill cost on the sibling
+// MXFP4_E4M3 loader (see ggml_cuda_ue4m3_to_fp32_raw_fast in common.cuh). The
+// selects below compile to a cndmask and are exact for every legal code 0x00..0x7E.
 static __device__ __forceinline__ float rocmfp4_ue4m3_to_fp32_half_finite(uint8_t x) {
 #if defined(GGML_USE_HIP) && GGML_ROCMFP4_USE_SCALE_LUT
     return x <= 0x7e ? rocmfp4_scale_ue4m3_half_lut[x] : 0.0f;
 #else
-    const int exp = (x >> 3) & 0xF;
-    const int man = x & 0x7;
-
-    if (exp == 0) {
-        return (float) man * (1.0f / 1024.0f);
-    }
-
+    const uint32_t exp = (x >> 3) & 0xF;
+    const uint32_t man = x & 0x7;
     const uint32_t bits = ((uint32_t) exp + 119u) << 23 | ((uint32_t) man << 20);
-    return rocmfp4_u32_as_f32(bits);
+    const float nrm = rocmfp4_u32_as_f32(bits);          // normal: (8+man) * 2^(exp-11)
+    const float sub = (float) man * (1.0f / 1024.0f);    // subnormal: man * 2^-10
+    const float v = exp == 0 ? sub : nrm;
+    return x <= 0x7e ? v : 0.0f;
 #endif
 }
 
 static __device__ __forceinline__ float rocmfpx_ue4m3_to_fp32_finite(uint8_t x) {
-    if (x > 0x7e) {
-        return 0.0f;
-    }
-
-    const int exp = (x >> 3) & 0xF;
-    const int man = x & 0x7;
-
-    if (exp == 0) {
-        return (float) man * (1.0f / 1024.0f);
-    }
-
+    // Branchless (see the note above): the former early return on x > 0x7e plus the
+    // exp == 0 branch both diverged; this computes both candidates and selects.
+    const uint32_t exp = (x >> 3) & 0xF;
+    const uint32_t man = x & 0x7;
     const uint32_t bits = ((uint32_t) exp + 119u) << 23 | ((uint32_t) man << 20);
-    return rocmfp4_u32_as_f32(bits);
+    const float nrm = rocmfp4_u32_as_f32(bits);
+    const float sub = (float) man * (1.0f / 1024.0f);
+    const float v = exp == 0 ? sub : nrm;
+    return x <= 0x7e ? v : 0.0f;
 }
 
 static __device__ __forceinline__ uint8_t rocmfpx_nearest_scale_ue4m3_cuda(float target_scale) {
