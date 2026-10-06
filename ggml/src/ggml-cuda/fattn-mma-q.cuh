@@ -151,7 +151,7 @@ static constexpr __host__ __device__ fattn_mma_config_q ggml_cuda_fattn_mma_q_ge
     GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(128, 128,  8,  64, 2,  32,  64,  64,  64, 1, true);
     GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(128, 128, 16,  64, 2,  32,  64,  64,  64, 1, true);
     GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(128, 128, 32, 128, 2,  64,  64,  64,  64, 1, true);
-    GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(128, 128, 64, 128, 2,  64,  64,  64,  64, 1, true);
+    GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(128, 128, 64, 128, 2,  32,  64,  64,  64, 1, true);
 
     GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(192, 128,  8,  64, 2,  32,  96,  64,  64, 1, true);
     GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(192, 128, 16,  64, 2,  32,  96,  64,  64, 1, true);
