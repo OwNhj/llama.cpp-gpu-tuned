@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-mma-f8.cuh"
 #include "fattn-mma-i8.cuh"
+#include "fattn-mma-q.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -527,6 +528,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16 = 400,
     BEST_FATTN_KERNEL_MMA_F8  = 500,
     BEST_FATTN_KERNEL_MMA_I8  = 600,
+    BEST_FATTN_KERNEL_MMA_Q   = 700,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -731,6 +733,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 (Q->ne[0] == 96 || Q->ne[0] == 128 || Q->ne[0] == 256)) {
             return BEST_FATTN_KERNEL_MMA_I8;
         }
+        // Multi-warp WMMA FA with quantized K tiles (route B, RDNA4): QK^T runs natively on
+        // i8/fp8 WMMA inside the f16 framework (stream-K, GQA packing, Q_in_reg all reused).
+        // V goes through the host-side f16 buffer. Requires DKQ % 32 == 0 (scale group).
+        const bool dkq_ok = Q->ne[0] == 96 || Q->ne[0] == 128 || (Q->ne[0] == 256 && K->type == GGML_TYPE_Q8_0);
+        if (sinks == nullptr && dkq_ok && V->ne[0] == Q->ne[0] && K->type == V->type &&
+                (Q->ne[2] / K->ne[2]) % 2 == 0 &&
+                (K->type == GGML_TYPE_F8 || K->type == GGML_TYPE_Q8_0)) {
+            const char * f8_env = getenv("F8_FATTN");
+            const char * i8_env = getenv("I8_FATTN");
+            if ((K->type == GGML_TYPE_F8 && f8_env != nullptr) || (K->type == GGML_TYPE_Q8_0 && i8_env != nullptr)) {
+                return BEST_FATTN_KERNEL_MMA_Q;
+            }
+        }
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
@@ -838,6 +853,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = false;
             need_f16_V = false;
             break;
+        case BEST_FATTN_KERNEL_MMA_Q:
+            // multi-warp WMMA FA with quantized K (f8/i8) + f16 V: only V needs the f16 buffer
+            need_f16_K = false;
+            need_f16_V = true;
+            break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
@@ -855,6 +875,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    const ggml_tensor * K = dst->src[1];
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -872,6 +893,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_I8:
             ggml_cuda_flash_attn_ext_mma_i8(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_Q:
+            ggml_cuda_flash_attn_ext_mma_q(ctx, dst, K->type == GGML_TYPE_F8 ? fattn_kv_type::f8 : fattn_kv_type::i8);
             break;
     }
 }
