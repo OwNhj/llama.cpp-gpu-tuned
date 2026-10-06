@@ -272,6 +272,43 @@ static __device__ __forceinline__ void dequantize_f8(const void * vx, const int6
     v.y = e.y * d;
 }
 
+// MXFP4 (KV cache): one E8M0 scale per 32 elements, nibble k holds elements k and k+16,
+// matching the generic QR=2 (iqs, iqs+qk/2) contract of the block dequant launchers.
+static __device__ __forceinline__ void dequantize_mxfp4_elem(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_mxfp4 * x = (const block_mxfp4 *) vx;
+
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e);
+    const uint8_t q = x[ib].qs[iqs];
+
+    // kvalues_mxfp4 is the doubled E2M1 table, so the /2 pairs with the full E8M0 scale.
+    v.x = d * kvalues_mxfp4[q & 0x0F]*0.5f;
+    v.y = d * kvalues_mxfp4[q >> 4]*0.5f;
+}
+
+// NVFP4 (KV cache): 64 elements, one UE4M3 scale per 16-element sub-block. The packed bytes
+// pair elements j and j+8 inside a sub-block, which is NOT the (iqs, iqs+qk/2) layout the
+// generic launcher assumes, so each element is addressed from its own index.
+static __device__ __forceinline__ float nvfp4_elem_at(const block_nvfp4 * x, const int64_t ib, const int e) {
+    const int s = e / QK_NVFP4_SUB;
+    const int j = e % QK_NVFP4_SUB;
+
+    // a byte holds elements j and j+8 of its sub-block (see quantize_row_nvfp4_ref)
+    const uint8_t byte = x[ib].qs[s*(QK_NVFP4_SUB/2) + (j % (QK_NVFP4_SUB/2))];
+    const uint8_t nib  = (j < QK_NVFP4_SUB/2) ? (byte & 0x0F) : (byte >> 4);
+
+    // The raw hardware decoder (amdgcn_cvt_f32_fp8 on RDNA4) skips the software ldexpf
+    // fallback of ue4m3_to_fp32, which showed up as a measurable prefill cost. It returns
+    // the raw UE4M3 value, so the /2 that pairs with the doubled kvalues table stays explicit.
+    return ggml_cuda_ue4m3_to_fp32_raw_fast(x[ib].d[s]) * kvalues_mxfp4[nib] * 0.5f;
+}
+
+static __device__ __forceinline__ void dequantize_nvfp4_elem(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_nvfp4 * x = (const block_nvfp4 *) vx;
+
+    v.x = nvfp4_elem_at(x, ib, iqs);
+    v.y = nvfp4_elem_at(x, ib, iqs + QK_NVFP4/2);
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

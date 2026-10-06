@@ -179,6 +179,105 @@ static __device__ void quantize_f32_f8_block(const float * __restrict__ x, block
     }
 }
 
+// Shared by the weight path (quantize.cu) and the KV-cache path: round amax to the nearest
+// E8M0 exponent. E2M1 max finite value is 6.0, so the shared exponent is round(log2(amax)) - 2.
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_e8m0(float amax) {
+    if (!(amax > 0.0f)) {
+        return 0;
+    }
+    const int biased = __float2int_rn(log2f(amax)) - 2 + 127;
+    return (uint8_t) min(max(biased, 0), 254);
+}
+
+// KV-cache encoder for MXFP4: E2M1 quants + one E8M0 scale per 32-element block.
+// The scale is chosen from the block amax without a SSE grid search (the CPU reference
+// does search): on KV writes this runs for every token, and amax-based scaling loses only
+// marginally. kvalues_fp4 is doubled, so the nibble encoder uses a 0.5/s scale factor.
+static __device__ void quantize_f32_mxfp4_block(const float * __restrict__ x, block_mxfp4 * __restrict__ y) {
+    float amax = 0.0f;
+
+    for (int j = 0; j < QK_MXFP4; j++) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+
+    const uint8_t e = ggml_cuda_fp32_to_e8m0(amax);
+    const float   d = ggml_cuda_e8m0_to_fp32(e);
+    const float   id = d > 0.0f ? 0.5f / d : 0.0f;  // e2m1 encoder compares |x| * 2 * id
+
+    y->e = e;
+
+    #pragma unroll
+    for (int j = 0; j < QK_MXFP4/2; j++) {
+        const uint8_t x0 = ggml_cuda_float_to_fp4_e2m1(x[j],          2.0f * id);
+        const uint8_t x1 = ggml_cuda_float_to_fp4_e2m1(x[j + QK_MXFP4/2], 2.0f * id);
+
+        y->qs[j] = x0 | (x1 << 4);
+    }
+}
+
+// Device UE4M3 encoder (round-to-nearest-even), value-identical to the CPU ggml_fp32_to_ue4m3.
+// The CUDA helper ggml_cuda_fp32_to_ue4m3 is compiled only for Blackwell, so the KV path needs
+// its own software encode.
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3_kv(float x) {
+    if (!(x > 0.0f) || !isfinite(x)) {
+        return 0;
+    }
+    if (x > 448.0f) {
+        x = 448.0f;
+    }
+    const uint32_t bits = __float_as_uint(x);
+    const int fp32_exp  = (int) ((bits >> 23) & 0xFF) - 127;
+    const int fp32_man  = (int) ((bits >> 20) & 0x7);
+    int ue4m3_exp = fp32_exp + 7;
+    if (ue4m3_exp <= 0) {
+        int man = (int) (x * 512.0f + 0.5f);
+        man = min(man, 7);
+        return man < 1 ? 0 : (uint8_t) man;
+    }
+    if (ue4m3_exp >= 15) {
+        return 0x7E;
+    }
+    int ue4m3_man = fp32_man + (int) ((bits >> 19) & 1);
+    if (ue4m3_man > 7) {
+        ue4m3_man = 0;
+        ue4m3_exp++;
+        if (ue4m3_exp >= 15) {
+            return 0x7E;
+        }
+    }
+    return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
+}
+
+// KV-cache encoder for NVFP4: E2M1 quants + one UE4M3 scale per 16-element sub-block.
+// Same amax/6.0 scaling as the CPU reference without the scale grid search.
+static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, block_nvfp4 * __restrict__ y) {
+    #pragma unroll
+    for (int s = 0; s < QK_NVFP4/QK_NVFP4_SUB; s++) {
+        const float * xb = x + s*QK_NVFP4_SUB;
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK_NVFP4_SUB; j++) {
+            amax = fmaxf(amax, fabsf(xb[j]));
+        }
+
+        const uint8_t ue = ggml_cuda_fp32_to_ue4m3_kv(amax / 6.0f);
+        // ue4m3_to_fp32 folds in the /2 that pairs with the doubled kvalues_fp4 table, so
+        // d here is raw/2 and the e2m1 encoder argument 1/raw equals 0.5/d.
+        const float   d  = ggml_cuda_ue4m3_to_fp32(ue);
+        const float   id = d > 0.0f ? 0.5f / d : 0.0f;
+
+        y->d[s] = ue;
+
+        #pragma unroll
+        for (int j = 0; j < QK_NVFP4_SUB/2; j++) {
+            const uint8_t x0 = ggml_cuda_float_to_fp4_e2m1(xb[j],           id);
+            const uint8_t x1 = ggml_cuda_float_to_fp4_e2m1(xb[j + QK_NVFP4_SUB/2], id);
+
+            y->qs[s*(QK_NVFP4_SUB/2) + j] = x0 | (x1 << 4);
+        }
+    }
+}
+
 static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;
