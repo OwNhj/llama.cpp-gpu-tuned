@@ -161,7 +161,7 @@ static constexpr __host__ __device__ fattn_mma_config_q ggml_cuda_fattn_mma_q_ge
     GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(256, 256, 32, 256, 2,  64, 128, 128,  64, 1, true);
-    GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(256, 256, 64, 256, 2,  64, 128, 128,  64, 1, true);
+    GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(256, 256, 64, 256, 2,  32, 128, 128,  64, 1, true);
 
     GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_Q_CONFIG_CASE(320, 256, 64, 128, 2,  32, 160, 128, 128, 1, true);
@@ -1378,13 +1378,26 @@ static __device__ __forceinline__ void flash_attn_ext_q_process_tile(
     extern __shared__ half2 tile_Q[];
     half2 * tile_K    = Q_in_reg              ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
     half2 * tile_V    =           nstages > 1 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
-    half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
+    half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max); // may be repacked by qsplit below
 
     // Quantized path scale tiles alias the SRAM base regions (tile_Q is dead after Q fragments
     // are built, tile_K holds quant data) with byte-accurate offsets computed in host launch.
+    // If the K/V tiles fit inside the Q staging area, the scale tiles need the smaller mask
+    // region out of the way, so put Kd/Qd/mask after the Q area to keep them disjoint at any nbatch_fa.
     constexpr int grp = DKQ/32;
-    float * tile_Kd   = (float *) (tile_mask + ncols1*(nbatch_fa + 8));
-    float * tile_Qd   = tile_Kd + nbatch_fa*grp;
+    constexpr bool qsplit = KV != fattn_kv_type::f16 &&
+        nbatch_fa * stride_tile_KV_max <= ncols * stride_tile_Q;
+    float * tile_Kd;
+    float * tile_Qd;
+    if constexpr (qsplit) {
+        tile_Kd = (float *) (tile_Q + ncols * stride_tile_Q);
+    } else {
+        tile_Kd = (float *) (tile_mask + ncols1*(nbatch_fa + 8));
+    }
+    tile_Qd = tile_Kd + nbatch_fa*grp;
+    if constexpr (qsplit) {
+        tile_mask = (half *) (tile_Qd + (KV == fattn_kv_type::i8 ? ncols*grp : 0));
+    }
 
     T_B_KQ    Q_B[(Q_in_reg ? (KV == fattn_kv_type::f16 ? DKQ/(2*T_B_KQ::J) : DKQ/32) : 1)];
 #if defined(TURING_MMA_AVAILABLE)
@@ -2263,7 +2276,10 @@ void ggml_cuda_flash_attn_ext_mma_q_case(ggml_backend_cuda_context & ctx, ggml_t
         (size_t) nbatch_fa * (DKQ/32) * sizeof(float) +
         (KV == fattn_kv_type::i8 ? (size_t) ncols * (DKQ/32) * sizeof(float) : 0);
 
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
+    const bool qsplit = KV != fattn_kv_type::f16 &&
+        (int64_t) nbatch_fa * std::max(stride_tile_K, stride_tile_V) <= (int64_t) ncols * (DKQ/2 + 4);
+    const size_t nbytes_shared_total = qsplit ?
+        std::max(nbytes_shared_combine, nbytes_shared_Q + nbytes_shared_mask + nbytes_shared_scale) : std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_scale) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask + nbytes_shared_scale);
 
