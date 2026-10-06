@@ -8075,6 +8075,17 @@ struct test_flash_attn_ext : public test_case {
         return 5e-4;
     }
 
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (hsk == 192) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            if (strcmp(ggml_backend_reg_name(reg), "ROCm") == 0) {
+                // f16 mma accumulation at head size 192 lands close to the default tolerance on RDNA
+                return std::max(test_case::max_nmse_err(backend), 2e-3);
+            }
+        }
+        return test_case::max_nmse_err(backend);
+    }
+
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
         // Just counting matmul costs:
