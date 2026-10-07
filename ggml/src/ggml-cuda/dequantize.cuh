@@ -641,6 +641,41 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
     }
 }
 
+// MXFP8: one 256-element block = 8 sub-blocks of 32 real E4M3 bytes + one E8M0 scale each.
+// The bytes decode straight to f32 with the hardware pair instruction; the scale is exact.
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_mxfp8(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    const block_mxfp8 * x = (const block_mxfp8 *) vx + ibs;
+
+    const int s  = tid % (QK_MXFP8 / QK_MXFP8_SUB);   // 0..7
+    const int e0 = (tid / (QK_MXFP8 / QK_MXFP8_SUB)) * 8;
+
+    const float d = ggml_cuda_e8m0_to_fp32(x->e[s]);
+    dst_t * y = yy + QK_MXFP8_SUB*s;
+
+#pragma unroll
+    for (int j = 0; j < 8; j += 2) {
+        const float2 v = ggml_cuda_e4m3x2_to_fp32(x->qs[s][e0 + j], x->qs[s][e0 + j + 1]);
+        y[e0 + j + 0] = ggml_cuda_cast<dst_t>(d * v.x);
+        y[e0 + j + 1] = ggml_cuda_cast<dst_t>(d * v.y);
+    }
+}
+
+// MXFP8 elementwise (QR=1): two adjacent elements, each in its own sub-block scale.
+static __device__ __forceinline__ float mxfp8_elem_at(const block_mxfp8 * x, const int i) {
+    const int s = i / QK_MXFP8_SUB;
+    const int j = i % QK_MXFP8_SUB;
+
+    return ggml_cuda_e8m0_to_fp32(x->e[s]) * ggml_cuda_e4m3x2_to_fp32(x->qs[s][j], 0).x;
+}
+
+static __device__ __forceinline__ void dequantize_mxfp8_elem(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_mxfp8 * x = (const block_mxfp8 *) vx + ib;
+
+    v.x = mxfp8_elem_at(x, iqs);
+    v.y = mxfp8_elem_at(x, iqs + 1);
+}
+
 // One E2M3 element of a mxfp6 block: sub-block e[s] * (1/8) * kvalues, code at bit 6*i in
 // the little-endian 6-bit stream. Shared by the block and elementwise dequant paths.
 static __device__ __forceinline__ float mxfp6_elem_at(const block_mxfp6 * x, const int i) {
