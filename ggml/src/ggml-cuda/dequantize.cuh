@@ -641,6 +641,62 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
     }
 }
 
+// One E2M3 element of a mxfp6 block: sub-block e[s] * (1/8) * kvalues, code at bit 6*i in
+// the little-endian 6-bit stream. Shared by the block and elementwise dequant paths.
+static __device__ __forceinline__ float mxfp6_elem_at(const block_mxfp6 * x, const int i) {
+    const int s = i / QK_MXFP6_SUB;
+    const int j = i % QK_MXFP6_SUB;
+
+    const int bit = 6*j;
+    const int byte = bit >> 3;
+    const int sh = bit & 7;
+    uint32_t w = x->qs[s][byte];
+    if (sh > 2) {
+        w |= (uint32_t) x->qs[s][byte + 1] << 8;
+    }
+    const uint8_t code = (uint8_t) ((w >> sh) & 0x3F);
+
+    return ggml_cuda_e8m0_to_fp32(x->e[s]) * (1.0f/8.0f) * (float) kvalues_mxfp6_e2m3[code];
+}
+
+// MXFP6: one 256-element block = 8 sub-blocks of 32, E2M3 codes in a little-endian 6-bit
+// stream, one E8M0 scale per sub-block. 32 threads, each thread decodes 8 consecutive elements
+// of one sub-block (tid%8 selects the sub-block, tid/8 the 8-element span).
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_mxfp6(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+    const block_mxfp6 * x = (const block_mxfp6 *) vx + ibs;
+
+    const int s  = tid % (QK_MXFP6 / QK_MXFP6_SUB);   // 0..7
+    const int e0 = (tid / (QK_MXFP6 / QK_MXFP6_SUB)) * 8;
+
+    const float d = ggml_cuda_e8m0_to_fp32(x->e[s]) * (1.0f/8.0f);
+    const uint8_t * pk = x->qs[s];
+    dst_t * y = yy + QK_MXFP6_SUB*s;
+
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int i = e0 + j;
+        const int bit = 6*i;
+        const int byte = bit >> 3;
+        const int sh = bit & 7;
+        uint32_t w = pk[byte];
+        if (sh > 2) {
+            w |= (uint32_t) pk[byte + 1] << 8;
+        }
+        const uint8_t code = (uint8_t) ((w >> sh) & 0x3F);
+        y[i] = ggml_cuda_cast<dst_t>(d * (float) kvalues_mxfp6_e2m3[code]);
+    }
+}
+
+// MXFP6 elementwise (QR=1): element iqs and its right neighbour, each in its own 32-elem
+// sub-block scale. Used by the non-contiguous dequant launcher.
+static __device__ __forceinline__ void dequantize_mxfp6_elem(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_mxfp6 * x = (const block_mxfp6 *) vx + ib;
+
+    v.x = mxfp6_elem_at(x, iqs);
+    v.y = mxfp6_elem_at(x, iqs + 1);
+}
+
 template<typename dst_t>
 static __device__ __forceinline__ void dequantize_mxfp4_e4m3(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
 

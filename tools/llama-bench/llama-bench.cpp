@@ -524,6 +524,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "mxfp4") {
         return GGML_TYPE_MXFP4;
     }
+    if (s == "mxfp6") {
+        return GGML_TYPE_MXFP6;
+    }
     if (s == "nvfp4") {
         return GGML_TYPE_NVFP4;
     }
