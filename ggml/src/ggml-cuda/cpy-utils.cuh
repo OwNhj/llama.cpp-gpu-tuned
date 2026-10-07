@@ -278,6 +278,89 @@ static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, bl
     }
 }
 
+// KV-cache encoder for MXFP6: E2M3 quants + one E8M0 scale per 32-element sub-block.
+// Mirrors quantize_row_mxfp6_ref on the CPU side: same amax -> exponent rule, same RTNE band
+// quantizer, same little-endian 6-bit stream packing (code i lives at bit 6*i).
+static __device__ __forceinline__ uint8_t ggml_cuda_mxfp6_quantize_mag(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    int e, m;
+    if (x < 1.0f) {
+        e = 0; m = (int) lrintf(8.0f*x);
+    } else if (x < 2.0f) {
+        e = 1; m = (int) lrintf(8.0f*(x - 1.0f));
+    } else if (x < 4.0f) {
+        e = 2; m = (int) lrintf(4.0f*(x - 2.0f));
+    } else {
+        e = 3; m = (int) lrintf(2.0f*(x - 4.0f));
+    }
+    if (m > 7) {
+        m = 0;
+        e++;
+    }
+    if (e > 3) {
+        // saturate to the largest finite E2M3
+        return 0x3F;
+    }
+    return (uint8_t) ((e << 3) | m);
+}
+
+static __device__ __forceinline__ uint8_t ggml_cuda_mxfp6_scale_for_amax(float amax) {
+    if (!(amax > 0.0f) || !isfinite(amax)) {
+        return 0;
+    }
+    int E;
+    const float f = frexpf(amax, &E);   // amax = f * 2^E, f in [0.5, 1)
+    const int p = (f <= 15.0f/16.0f) ? E - 3 : E - 2;
+    return (uint8_t) (p + 127);
+}
+
+static __device__ void quantize_f32_mxfp6_block(const float * __restrict__ x, block_mxfp6 * __restrict__ y) {
+#pragma unroll
+    for (int s = 0; s < QK_MXFP6/QK_MXFP6_SUB; ++s) {
+        const float * xb = x + s*QK_MXFP6_SUB;
+
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < QK_MXFP6_SUB; ++j) {
+            amax = fmaxf(amax, fabsf(xb[j]));
+        }
+
+        const uint8_t e = ggml_cuda_mxfp6_scale_for_amax(amax);
+        y->e[s] = e;
+
+        const float d_inv = amax > 0.0f ? 1.0f / ggml_cuda_e8m0_to_fp32(e) : 0.0f;
+
+        uint8_t codes[QK_MXFP6_SUB];
+#pragma unroll
+        for (int j = 0; j < QK_MXFP6_SUB; ++j) {
+            const float v = xb[j] * d_inv;
+            codes[j] = (uint8_t) (ggml_cuda_mxfp6_quantize_mag(fabsf(v)) | (v < 0.0f ? 0x20 : 0x00));
+        }
+
+        uint8_t * dst = y->qs[s];
+#pragma unroll
+        for (int j = 0; j < QK_MXFP6_SUB*6/8/4; ++j) {  // 24 bytes = 6 x uint32 (qs rows are 4B aligned)
+            ((uint32_t *) dst)[j] = 0;
+        }
+#pragma unroll
+        for (int j = 0; j < QK_MXFP6_SUB; ++j) {
+            const int bit = 6*j;
+            const int byte = bit >> 3;
+            const int sh = bit & 7;
+            if (sh <= 2) {
+                // fully inside one byte (also covers the last code, no byte+1 read)
+                dst[byte] = (uint8_t) ((dst[byte] & ~(0x3Fu << sh)) | (codes[j] << sh));
+            } else {
+                const int nb1 = sh - 2;  // code bits landing in byte+1
+                dst[byte]   = (uint8_t) ((dst[byte]   & ~(0xFFu << sh))       | (codes[j] << sh));
+                dst[byte+1] = (uint8_t) ((dst[byte+1] &  (0xFFu << nb1))      | (codes[j] >> (8 - sh)));
+            }
+        }
+    }
+}
+
 static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;
