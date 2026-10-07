@@ -736,13 +736,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // Multi-warp WMMA FA with quantized K tiles (route B, RDNA4): QK^T runs natively on
         // i8/fp8 WMMA inside the f16 framework (stream-K, GQA packing, Q_in_reg all reused).
         // V goes through the host-side f16 buffer. Requires DKQ % 32 == 0 (scale group).
-        const bool dkq_ok = Q->ne[0] == 96 || Q->ne[0] == 128 || (Q->ne[0] == 256 && K->type == GGML_TYPE_Q8_0);
+        const bool dkq_ok = Q->ne[0] == 96 || Q->ne[0] == 128 || (Q->ne[0] == 256 && (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_BF16));
         if (sinks == nullptr && dkq_ok && V->ne[0] == Q->ne[0] && K->type == V->type &&
                 (Q->ne[2] / K->ne[2]) % 2 == 0 &&
-                (K->type == GGML_TYPE_F8 || K->type == GGML_TYPE_Q8_0)) {
+                (K->type == GGML_TYPE_F8 || K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_BF16)) {
             const char * f8_env = getenv("F8_FATTN");
             const char * i8_env = getenv("I8_FATTN");
-            if ((K->type == GGML_TYPE_F8 && f8_env != nullptr) || (K->type == GGML_TYPE_Q8_0 && i8_env != nullptr)) {
+            const char * bf16_env = getenv("BF16_FATTN");
+            if ((K->type == GGML_TYPE_F8 && f8_env != nullptr) || (K->type == GGML_TYPE_Q8_0 && i8_env != nullptr) ||
+                    (K->type == GGML_TYPE_BF16 && bf16_env != nullptr)) {
                 return BEST_FATTN_KERNEL_MMA_Q;
             }
         }
@@ -895,7 +897,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_mma_i8(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_Q:
-            ggml_cuda_flash_attn_ext_mma_q(ctx, dst, K->type == GGML_TYPE_F8 ? fattn_kv_type::f8 : fattn_kv_type::i8);
+            ggml_cuda_flash_attn_ext_mma_q(ctx, dst,
+                    K->type == GGML_TYPE_F8   ? fattn_kv_type::f8 :
+                    K->type == GGML_TYPE_BF16 ? fattn_kv_type::bf16 : fattn_kv_type::i8);
             break;
     }
 }
