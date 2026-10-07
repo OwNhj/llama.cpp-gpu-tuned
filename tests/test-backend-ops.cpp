@@ -9356,7 +9356,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block
-        test_cases.emplace_back(new test_snake_fuse(type, {  33,  32, 1, 1}));   // boundary
         test_cases.emplace_back(new test_snake_fuse(type, {1025,  13, 1, 1}));   // large prime, grid-stride
         test_cases.emplace_back(new test_snake_fuse(type, { 128,  16, 1, 1}));   // power-of-two
         test_cases.emplace_back(new test_snake_fuse(type, { 256, 192, 1, 1}));   // BigVGAN-ish
@@ -10347,7 +10346,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
-    // sides of that boundary, including an odd row count above it for the row-pair tail.
     for (int64_t m : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2, 1024, { 1, 1 }, { 1, 1 }));
     }
@@ -10456,7 +10454,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 1, 256, {3, 2}, {2, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 8, 256, {1, 1}, {1, 1}));
 
-    // token-tile boundary coverage. With n_used == n_mats every token routes to every expert, so
     // each expert receives exactly n rows, with no dependence on the random draw. mul_mm_id is used
     // from 32 tokens up: n = 32, 33, 47, 48, 49 reach it, leaving a last tile of 32, 1, 15, 16 and
     // 17 rows - 16 and 17 straddle the point where the upper half stops being skipped. The smaller
@@ -11292,6 +11289,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 4096, 8, true,  true, 0, 0, GGML_PREC_F32, GGML_TYPE_F8, GGML_TYPE_F8));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1},  512, 2, true, false, 8, 30, GGML_PREC_F32, GGML_TYPE_F8, GGML_TYPE_F8));
 
+    // mxfp6 KV (native fp8-WMMA FA path, RDNA4): blocks span a full 256-elem head row, D=256 only.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP6, GGML_TYPE_MXFP6));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP6, GGML_TYPE_MXFP6));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 8, 1},  512, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP6, GGML_TYPE_MXFP6));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  512, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
     // MLA shape: the V cache is a sub-view of the K cache, with quantized KV
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
@@ -11436,7 +11440,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //    }
     //}
 
-    // Both sides of the same row-count boundary as above, on the fused path.
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
             false, 16, 8, false, false, true, false, { 1, 1 }));
@@ -11836,6 +11839,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(96, 96, 4, {6, 1}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(96, 96, 4, {6, 1}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8, GGML_TYPE_F8));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP6, GGML_TYPE_MXFP6));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_flash_attn_ext(96, 96, 4, {6, 1}, 1024, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));

@@ -382,10 +382,10 @@ static constexpr __device__ int ggml_cuda_fattn_mma_q_get_nstages(
 
 // KV quantization for the multi-warp WMMA FA path. f8/i8 keep K in its quantized layout
 // and run QK^T on native fp8/i8 WMMA (RDNA4 only); V stays f16 (host-side dequant).
-enum class fattn_kv_type { f16, f8, i8, bf16 };
+enum class fattn_kv_type { f16, f8, i8, mxfp6, bf16 };
 
 static constexpr __host__ __device__ bool fattn_kv_is_quant(const fattn_kv_type kv) {
-    return kv == fattn_kv_type::f8 || kv == fattn_kv_type::i8;
+    return kv == fattn_kv_type::f8 || kv == fattn_kv_type::i8 || kv == fattn_kv_type::mxfp6;
 }
 
 // bf16 KQ reuses the f16 framework bit paths with bf16 fragment tiles (same 2B layout on AMD WMMA).
@@ -403,12 +403,9 @@ static __device__ __forceinline__ void flash_attn_ext_q_load_tile_q8(
         const char * const __restrict__ K_raw, const int stride_K_blk,
         int * const __restrict__ tile_K, float * const __restrict__ tile_Kd,
         const int k_VKQ_0, const int i_sup, const int n_kv_max) {
-    using blk_t = std::conditional_t<KV == fattn_kv_type::f8, block_f8, block_q8_0>;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int grp = DKQ/32;                 // 32-elem scale groups per row
     static_assert(stride_int >= DKQ/4 && (stride_int - DKQ/4)*4 == 16, "quant K rows need 16B padding");
-
-    const blk_t * const __restrict__ K_blk = (const blk_t *) K_raw; // stride_K_blk in blocks
 
     for (int idx = threadIdx.x + threadIdx.y*warp_size; idx < nbatch_fa*grp; idx += nwarps*warp_size) {
         const int s = idx / grp;
@@ -416,16 +413,39 @@ static __device__ __forceinline__ void flash_attn_ext_q_load_tile_q8(
         const int seq = k_VKQ_0 + s;
         int * dst_q = tile_K + s*stride_int + g*8;
         if (seq < n_kv_max && s < i_sup) {
-            const blk_t * blk = K_blk + int64_t(seq)*stride_K_blk + g;
-            ggml_cuda_memcpy_1<4>(dst_q + 0, blk->qs +  0);
-            ggml_cuda_memcpy_1<4>(dst_q + 1, blk->qs +  4);
-            ggml_cuda_memcpy_1<4>(dst_q + 2, blk->qs +  8);
-            ggml_cuda_memcpy_1<4>(dst_q + 3, blk->qs + 12);
-            ggml_cuda_memcpy_1<4>(dst_q + 4, blk->qs + 16);
-            ggml_cuda_memcpy_1<4>(dst_q + 5, blk->qs + 20);
-            ggml_cuda_memcpy_1<4>(dst_q + 6, blk->qs + 24);
-            ggml_cuda_memcpy_1<4>(dst_q + 7, blk->qs + 28);
-            tile_Kd[(size_t)g*nbatch_fa + s] = __half2float(blk->d);
+            if constexpr (KV == fattn_kv_type::mxfp6) {
+                // A K head row is one block_mxfp6: 8 sub-blocks of 32, E2M3 codes in a little-endian
+                // 6-bit stream + one E8M0 scale per sub-block. Expand each code to its lossless E4M3
+                // byte (kvalues_mxfp6_e4m3) so the fp8 WMMA path runs unchanged; E8M0*(1/8) is exact in f32.
+                const block_mxfp6 * blk = (const block_mxfp6 *) K_raw + int64_t(seq)*stride_K_blk;
+                const uint8_t * pk = blk->qs[g];
+                uint8_t * dq = (uint8_t *) dst_q;
+#pragma unroll
+                for (int j = 0; j < 32; ++j) {
+                    const int bit = 6*j;
+                    const int byte = bit >> 3;
+                    const int sh = bit & 7;
+                    uint32_t w = pk[byte];
+                    if (sh > 2) {
+                        w |= (uint32_t) pk[byte + 1] << 8;
+                    }
+                    dq[j] = kvalues_mxfp6_e4m3[(w >> sh) & 0x3F];
+                }
+                tile_Kd[(size_t)g*nbatch_fa + s] = ggml_cuda_e8m0_to_fp32(blk->e[g]);
+            } else {
+                using blk_t = std::conditional_t<KV == fattn_kv_type::f8, block_f8, block_q8_0>;
+                const blk_t * const __restrict__ K_blk = (const blk_t *) K_raw; // stride_K_blk in blocks
+                const blk_t * blk = K_blk + int64_t(seq)*stride_K_blk + g;
+                ggml_cuda_memcpy_1<4>(dst_q + 0, blk->qs +  0);
+                ggml_cuda_memcpy_1<4>(dst_q + 1, blk->qs +  4);
+                ggml_cuda_memcpy_1<4>(dst_q + 2, blk->qs +  8);
+                ggml_cuda_memcpy_1<4>(dst_q + 3, blk->qs + 12);
+                ggml_cuda_memcpy_1<4>(dst_q + 4, blk->qs + 16);
+                ggml_cuda_memcpy_1<4>(dst_q + 5, blk->qs + 20);
+                ggml_cuda_memcpy_1<4>(dst_q + 6, blk->qs + 24);
+                ggml_cuda_memcpy_1<4>(dst_q + 7, blk->qs + 28);
+                tile_Kd[(size_t)g*nbatch_fa + s] = __half2float(blk->d);
+            }
         } else {
 #pragma unroll
             for (int i = 0; i < 8; ++i) { dst_q[i] = 0; }
@@ -827,7 +847,7 @@ static __device__ __forceinline__ void flash_attn_ext_q_iter(
                     }
                 }
                 T_C_KQ & KQ_c = KQ_C[i_KQ_00/(np*T_A_KQ::I)];
-                if constexpr (KV == fattn_kv_type::f8) {
+                if constexpr (KV != fattn_kv_type::i8) {
                     tile<16, 16, float, DATA_LAYOUT_I_MAJOR> tmp;
 #pragma unroll
                     for (int l = 0; l < T_C_KQ::ne; ++l) { tmp.x[l] = 0.0f; }
@@ -1505,7 +1525,7 @@ static __device__ __forceinline__ void flash_attn_ext_q_process_tile(
             const int jc = idx / grp;
             const int g  = idx % grp;
             const half2 * src = tile_Q + jc*stride_tile_Q + g*16;
-            if constexpr (KV == fattn_kv_type::f8) {
+            if constexpr (KV != fattn_kv_type::i8) {
 #pragma unroll
                 for (int gi = 0; gi < 8; ++gi) {
                     uint8_t * qb = (uint8_t *) &qres[t][gi];
@@ -2133,7 +2153,10 @@ static __global__ void flash_attn_ext_q(
     const int stride_K    = nb11 / sizeof(half2);
     const int stride_mask = nb31 / sizeof(half);
 
-    const int stride_K_blk = nb11 / (KV == fattn_kv_type::f8 ? (int) sizeof(block_f8) : (KV == fattn_kv_type::i8 ? (int) sizeof(block_q8_0) : (int) sizeof(half2)));
+
+    const int stride_K_blk = nb11 / (KV == fattn_kv_type::f8   ? (int) sizeof(block_f8) :
+                                      KV == fattn_kv_type::i8  ? (int) sizeof(block_q8_0) :
+                                      KV == fattn_kv_type::mxfp6 ? (int) sizeof(block_mxfp6) : (int) sizeof(half2));
     const int n_kv_max     = ne11;
 
     const int stride_V = V_is_K_view ? stride_K : nb21 / sizeof(half2);
@@ -2470,6 +2493,11 @@ DECL_FATTN_MMA_Q_KV_CASE( 96,  96, 32,  2, fattn_kv_type::bf16);
 DECL_FATTN_MMA_Q_KV_CASE( 96,  96, 16,  4, fattn_kv_type::bf16);
 DECL_FATTN_MMA_Q_KV_CASE( 96,  96,  8,  8, fattn_kv_type::bf16);
 
+DECL_FATTN_MMA_Q_KV_CASE(256, 256, 64,  1, fattn_kv_type::mxfp6);
+DECL_FATTN_MMA_Q_KV_CASE(256, 256, 32,  2, fattn_kv_type::mxfp6);
+DECL_FATTN_MMA_Q_KV_CASE(256, 256, 16,  4, fattn_kv_type::mxfp6);
+DECL_FATTN_MMA_Q_KV_CASE(256, 256,  8,  8, fattn_kv_type::mxfp6);
+
 DECL_FATTN_MMA_Q_KV_CASE(128, 128, 64,  1, fattn_kv_type::f8);
 DECL_FATTN_MMA_Q_KV_CASE(128, 128, 32,  2, fattn_kv_type::f8);
 DECL_FATTN_MMA_Q_KV_CASE(128, 128, 16,  4, fattn_kv_type::f8);
@@ -2503,20 +2531,23 @@ static void ggml_cuda_flash_attn_ext_mma_q(ggml_backend_cuda_context & ctx, ggml
     switch (Q->ne[0]) {
         case 96:
             GGML_ASSERT(Q->ne[0] % 32 == 0);
+            GGML_ASSERT(kv != fattn_kv_type::mxfp6); // mxfp6 blocks are 256 elements, D=256 only
             if      (kv == fattn_kv_type::f8)  { ggml_cuda_flash_attn_ext_mma_q_switch< 96,  96, fattn_kv_type::f8 >(ctx, dst); }
             else if (kv == fattn_kv_type::i8)  { ggml_cuda_flash_attn_ext_mma_q_switch< 96,  96, fattn_kv_type::i8 >(ctx, dst); }
             else                               { ggml_cuda_flash_attn_ext_mma_q_switch< 96,  96, fattn_kv_type::bf16>(ctx, dst); }
             break;
         case 128:
+            GGML_ASSERT(kv != fattn_kv_type::mxfp6);
             if      (kv == fattn_kv_type::f8)  { ggml_cuda_flash_attn_ext_mma_q_switch<128, 128, fattn_kv_type::f8 >(ctx, dst); }
             else if (kv == fattn_kv_type::i8)  { ggml_cuda_flash_attn_ext_mma_q_switch<128, 128, fattn_kv_type::i8 >(ctx, dst); }
             else                               { ggml_cuda_flash_attn_ext_mma_q_switch<128, 128, fattn_kv_type::bf16>(ctx, dst); }
             break;
         case 256:
-            if      (kv == fattn_kv_type::i8)  { ggml_cuda_flash_attn_ext_mma_q_switch<256, 256, fattn_kv_type::i8 >(ctx, dst); }
-            else if (kv == fattn_kv_type::bf16){ ggml_cuda_flash_attn_ext_mma_q_switch<256, 256, fattn_kv_type::bf16>(ctx, dst); }
-            else                               { GGML_ASSERT(kv == fattn_kv_type::f8);
-                                                 ggml_cuda_flash_attn_ext_mma_q_switch<256, 256, fattn_kv_type::f8 >(ctx, dst); }
+            if      (kv == fattn_kv_type::i8)    { ggml_cuda_flash_attn_ext_mma_q_switch<256, 256, fattn_kv_type::i8   >(ctx, dst); }
+            else if (kv == fattn_kv_type::bf16)  { ggml_cuda_flash_attn_ext_mma_q_switch<256, 256, fattn_kv_type::bf16 >(ctx, dst); }
+            else if (kv == fattn_kv_type::mxfp6) { ggml_cuda_flash_attn_ext_mma_q_switch<256, 256, fattn_kv_type::mxfp6>(ctx, dst); }
+            else                                 { GGML_ASSERT(kv == fattn_kv_type::f8);
+                                                   ggml_cuda_flash_attn_ext_mma_q_switch<256, 256, fattn_kv_type::f8   >(ctx, dst); }
             break;
         default:
             GGML_ABORT("fatal error");
