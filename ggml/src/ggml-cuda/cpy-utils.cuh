@@ -316,6 +316,39 @@ static __device__ __forceinline__ uint8_t ggml_cuda_mxfp6_scale_for_amax(float a
     return (uint8_t) (p + 127);
 }
 
+// KV-cache encoder for MXFP8: real E4M3FN quants + one E8M0 scale per 32-element sub-block.
+// Mirrors quantize_row_mxfp8_ref (no SSE grid search, same as the other KV encoders): the
+// exponent is the smallest power of two keeping amax inside the E4M3FN range (448).
+static __device__ void quantize_f32_mxfp8_block(const float * __restrict__ x, block_mxfp8 * __restrict__ y) {
+#pragma unroll
+    for (int s = 0; s < QK_MXFP8/QK_MXFP8_SUB; ++s) {
+        const float * xb = x + s*QK_MXFP8_SUB;
+
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < QK_MXFP8_SUB; ++j) {
+            amax = fmaxf(amax, fabsf(xb[j]));
+        }
+
+        uint8_t e = 0;
+        if (amax > 0.0f) {
+            int E;
+            const float f = frexpf(amax, &E);   // amax = f * 2^E, f in [0.5, 1)
+            const int p = (f <= 7.0f/8.0f) ? E - 9 : E - 8;
+            e = (uint8_t) (p + 127);
+        }
+        y->e[s] = e;
+
+        const float d_inv = ggml_cuda_e8m0_to_fp32(e) > 0.0f ? 1.0f / ggml_cuda_e8m0_to_fp32(e) : 0.0f;
+#pragma unroll
+        for (int j = 0; j < QK_MXFP8_SUB; j += 2) {
+            const uint16_t q = ggml_cuda_fp32x2_to_e4m3x2(xb[j]*d_inv, xb[j + 1]*d_inv);
+            y->qs[s][j + 0] = (uint8_t) (q & 0xFFu);
+            y->qs[s][j + 1] = (uint8_t) (q >> 8);
+        }
+    }
+}
+
 static __device__ void quantize_f32_mxfp6_block(const float * __restrict__ x, block_mxfp6 * __restrict__ y) {
 #pragma unroll
     for (int s = 0; s < QK_MXFP6/QK_MXFP6_SUB; ++s) {
