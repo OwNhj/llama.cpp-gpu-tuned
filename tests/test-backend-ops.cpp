@@ -11293,6 +11293,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP6, GGML_TYPE_MXFP6));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP6, GGML_TYPE_MXFP6));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 8, 1},  512, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP6, GGML_TYPE_MXFP6));
+
+    // mxfp4/nvfp4 (int8 WMMA) + mxfp8 (fp8 WMMA) native FA correctness cases.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  512, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, { 4, 1},  512, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext( 96,  96, 4, { 2, 1},  512, 9, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  512, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, { 4, 1},  512, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  512, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP8, GGML_TYPE_MXFP8));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, { 8, 1},  512, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_MXFP8, GGML_TYPE_MXFP8));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},  512, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
