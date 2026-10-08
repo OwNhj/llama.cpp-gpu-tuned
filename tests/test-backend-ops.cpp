@@ -10330,7 +10330,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // rocmf custom quantized types (ROCm native tensor-core paths): MUL_MAT regression +
     // WMMA verification. CPU reference via dequant (to_float); GPU via int8/i4 WMMA MMQ + MMVQ.
     // PTQ1_0 MMQ shape bisection: full tile rows (m>=I), many K blocks, big n.
-    for (ggml_type type_a : { GGML_TYPE_PTQ1_0 }) {
+    for (ggml_type type_a : { GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0 }) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16,  9, 5*256,  {1, 1}, {1, 1})); // multi K-block
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64,  9, 1*256,  {1, 1}, {1, 1})); // full I tile
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128, 9, 20*256, {1, 1}, {1, 1})); // full tile + many K
