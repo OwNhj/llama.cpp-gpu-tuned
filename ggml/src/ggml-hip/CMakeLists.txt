@@ -119,6 +119,10 @@ if (GGML_HIP_ROCMI4_W4A4)
     add_compile_definitions(GGML_ROCMI4_W4A4=1)
 endif()
 
+if (GGML_HIP_PTQ1_0_I4)
+    add_compile_definitions(GGML_CUDA_PTQ1_0_I4=1)
+endif()
+
 if (GGML_HIP_EXPORT_METRICS)
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
 endif()

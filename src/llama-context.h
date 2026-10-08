@@ -288,6 +288,10 @@ private:
 
     const llama_model & model;
 
+    // prism.hadamard (PTQ1_0/PQ2_0): activation-side transforms for folded weights
+    llama_hadamard_rotations hadamard_rotations;
+    llama_hadamard_rotations hadamard_inverses;
+
     llama_cparams cparams;
 
     llama_adapter_cvec_ptr  cvec;

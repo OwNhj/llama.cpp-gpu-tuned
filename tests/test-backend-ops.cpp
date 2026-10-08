@@ -5055,7 +5055,7 @@ struct test_mul_mat : public test_case {
             }
             // W4A4 puts activations on a 4-bit grid (step amax/7), the coarsest of the three. Theory
             // is 5.1e-3 for uniform and 9.4e-3 for per-32-block Gaussian inputs, measured 5.3e-3.
-            if ((type_a == GGML_TYPE_Q4_0_ROCMI4 || type_a == GGML_TYPE_Q4_0_SYM4) &&
+            if ((type_a == GGML_TYPE_Q4_0_ROCMI4 || type_a == GGML_TYPE_Q4_0_SYM4 || type_a == GGML_TYPE_PTQ1_0) &&
                 backend_has_feature(backend, "RDNA4_W4A4")) {
                 return 2e-2;
             }
@@ -5330,7 +5330,7 @@ struct test_mul_mat_id : public test_case {
             }
             // W4A4 puts activations on a 4-bit grid (step amax/7), the coarsest of the three. Theory
             // is 5.1e-3 for uniform and 9.4e-3 for per-32-block Gaussian inputs, measured 5.3e-3.
-            if ((type_a == GGML_TYPE_Q4_0_ROCMI4 || type_a == GGML_TYPE_Q4_0_SYM4) &&
+            if ((type_a == GGML_TYPE_Q4_0_ROCMI4 || type_a == GGML_TYPE_Q4_0_SYM4 || type_a == GGML_TYPE_PTQ1_0) &&
                 backend_has_feature(backend, "RDNA4_W4A4")) {
                 return 2e-2;
             }
@@ -9275,6 +9275,8 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
+    GGML_TYPE_PQ2_0,
+    GGML_TYPE_PTQ1_0,
     GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
     GGML_TYPE_MXFP6, GGML_TYPE_MXFP8, GGML_TYPE_MXFP4_E4M3,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
@@ -10341,6 +10343,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // rocmf custom quantized types (ROCm native tensor-core paths): MUL_MAT regression +
     // WMMA verification. CPU reference via dequant (to_float); GPU via int8/i4 WMMA MMQ + MMVQ.
+    // PTQ1_0 MMQ shape bisection: full tile rows (m>=I), many K blocks, big n.
+    for (ggml_type type_a : { GGML_TYPE_PTQ1_0 }) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16,  9, 5*256,  {1, 1}, {1, 1})); // multi K-block
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 64,  9, 1*256,  {1, 1}, {1, 1})); // full I tile
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128, 9, 20*256, {1, 1}, {1, 1})); // full tile + many K
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 512, 20*256, {1, 1}, {1, 1})); // real shape
+    }
+
     for (ggml_type type_a : { GGML_TYPE_Q4_0_ROCMI4, GGML_TYPE_Q4_0_SYM4 }) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, i, 1*256, {1, 1}, {1, 1}));

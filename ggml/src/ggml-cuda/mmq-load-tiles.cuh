@@ -138,20 +138,12 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         for (int j = 0; j < 4; ++j) {
             const int q  = qxi[j];
 
-#if defined(GGML_USE_HIP)
-            const uint32_t qx_indices = (q & 0x03) | ((q & 0x0C) << 6) | ((q & 0x30) << 12) | ((q & 0xC0) << 18);
-            const uint32_t qy_bits    = q >> 8;
-            const uint32_t qy_indices = (qy_bits & 0x03) | ((qy_bits & 0x0C) << 6) | ((qy_bits & 0x30) << 12) | ((qy_bits & 0xC0) << 18);
-            const int qx = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qx_indices);
-            const int qy = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, qy_indices);
-#else
             // unpack even and odd crumbs into byte values
             const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
             const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
             // unshuffle values
             const int qx = __byte_perm(qe, qo, 0x5140);
             const int qy = __byte_perm(qe, qo, 0x7362);
-#endif // defined(GGML_USE_HIP)
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride           + dst_offset + j*2+0] = qx;
@@ -181,6 +173,178 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #else
         x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = bxi->d;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
+// Q2_0 group 128: identical layout to load_tiles_q2_0 with QK/QI/block for the 128-group format.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_pq2_0(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int blocks_per_iter = MMQ_ITER_K / QK_PQ2_0;
+    constexpr int threads_per_row = blocks_per_iter * QI_PQ2_0;
+    constexpr int nrows = warp_size / threads_per_row;
+    constexpr int scale_entries_per_block = QK_PQ2_0 / QK8_1;
+    constexpr int scale_entries_per_row = blocks_per_iter * scale_entries_per_block;
+
+    const int txi  = threadIdx.x % threads_per_row;
+    const int kbx  = txi / QI_PQ2_0;
+    const int kqsx = txi % QI_PQ2_0;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_pq2_0 * bxi = (const block_pq2_0 *) x + kbx0 + i*stride + kbx;
+        const int16_t         * qxi = (const int16_t *) bxi->qs + kqsx * 4;
+
+        const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int q  = qxi[j];
+
+#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+            const int qx = q2_0_symbols4_hip((uint32_t) q & 0xFFu);
+            const int qy = q2_0_symbols4_hip(((uint32_t) q >> 8) & 0xFFu);
+#else
+            const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+            const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+            const int qx = __byte_perm(qe, qo, 0x5140);
+            const int qy = __byte_perm(qe, qo, 0x7362);
+#endif // defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*sram_stride           + dst_offset + j*2+0] = qx;
+            x_qs[i*sram_stride           + dst_offset + j*2+1] = qy;
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + j*2+0] = qx;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + j*2+1] = qy;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+    }
+
+    const int ksx = threadIdx.x % scale_entries_per_row;
+    const int scale_block = ksx / scale_entries_per_block;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps) {
+        int i = i0 + threadIdx.y;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_pq2_0 * bxi = (const block_pq2_0 *) x + kbx0 + i*stride + scale_block;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride                           + ksx] = bxi->d;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = bxi->d;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const char * __restrict__ x,
+                                                                       int * __restrict__ x_tile,
+                                                                       const int kbx0,
+                                                                       const int i_max,
+                                                                       const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int *   x_qs = (int *) x_tile;
+    float * x_df = (float *) (x_qs + 2 * MMQ_TILE_NE_K);
+
+    // One thread decodes one 128-element block into 32 natural-order int8 tile ints.
+    // All 5 trits of a 4-byte group share one trit index inside each on-disk chunk, so the
+    // whole block decodes branch-free from six dword loads (qs) + one word (qh):
+    //   ints 0..19  : qs dword (d&3), pow3[d>>2]        (elements 0..79)
+    //   ints 20..29 : qs dword 4+(k&1), pow3[k>>1]      (elements 80..119)
+    //   ints 30..31 : qh bytes alternate, pow3[t>>1]    (elements 120..127)
+    constexpr int threads_per_row = 2;                 // two 128-elem blocks per 256-elem row
+    constexpr int nrows           = warp_size / threads_per_row;
+
+    const int txi = threadIdx.x % warp_size;
+    const int sub = txi % threads_per_row;             // which block of the row (0..1)
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows * nwarps) {
+        int i = i0 + threadIdx.y * nrows + txi / threads_per_row;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_ptq1_0 * bx = (const block_ptq1_0 *) x + kbx0 + i * stride + sub;
+        int * row = x_qs + i * sram_stride + sub * (QK_PTQ1_0 / 4);
+
+        int qw[6];
+        {
+            // blocks are 26 B apart -> qs is not 4-byte aligned; copy is the safe path
+#pragma unroll
+            for (int dw = 0; dw < 6; ++dw) {
+                memcpy(&qw[dw], bx->qs + 4 * dw, 4);
+            }
+        }
+        const int qh0 = (int) bx->qh[0];
+        const int qh1 = (int) bx->qh[1];
+
+#pragma unroll
+        for (int d = 0; d < 20; ++d) {
+            const int n = d >> 2;
+            const uint32_t p3 = n == 0 ? 1u : n == 1 ? 3u : n == 2 ? 9u : n == 3 ? 27u : 81u;
+            row[d] = ptq1_0_decode4_int8_same_trit(qw[d & 3], p3);
+        }
+#pragma unroll
+        for (int k = 0; k < 10; ++k) {
+            const int n = k >> 1;
+            const uint32_t p3 = n == 0 ? 1u : n == 1 ? 3u : n == 2 ? 9u : n == 3 ? 27u : 81u;
+            row[20 + k] = ptq1_0_decode4_int8_same_trit(qw[4 + (k & 1)], p3);
+        }
+#pragma unroll
+        for (int dd = 0; dd < 2; ++dd) {
+            int c = 0;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int t     = dd * 4 + b;          // e - 120
+                const int bytev = (t & 1) ? qh1 : qh0;
+                const int n     = t >> 1;              // 0..3
+                const uint32_t p3 = n == 0 ? 1u : n == 1 ? 3u : n == 2 ? 9u : 27u;
+                c |= (ptq1_0_trit_pow3((uint32_t) bytev, p3) & 0xFF) << (8 * b);
+            }
+            row[30 + dd] = c;
+        }
+    }
+
+    // 8 scale slots per row: block 0's fp16 d into slots 0..3, block 1's into 4..7.
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * 4) {
+        int i = i0 + threadIdx.y * 4 + (threadIdx.x % warp_size) / 8;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+        const int slot = threadIdx.x % 8;
+        const block_ptq1_0 * bxi = (const block_ptq1_0 *) x + kbx0 + i * stride + slot / 4;
+        x_df[i * sram_stride + slot] = bxi->d;
     }
 }
 
@@ -2300,9 +2464,97 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #if GGML_ROCMI4_W4A4
 // ---------------------------------------------------------------------------
-// Q4_0_ROCMI4 native-i4 W4A4 (gfx12, RDNA4): weights stay packed nibbles in
-// LDS. Row (44 ints) per K=256 elements (MMQ_ITER_K): [32 int data][8 float scale][4 pad];
-// consumed by the v_wmma_i32_16x16x32_iu4 tensor core (natural nibble order).
+// PTQ1_0 W4A4 (gfx12, RDNA4): dequantize the ternary weights {-1,0,1} to signed
+// 4-bit codes at tile-load time, then run the standard iu4 W4A4 dot. The x-tile
+// layout is the same 44-int row the ROCMI4 W4A4 loader produces (32 data ints in
+// byte-interleaved nibble order + 8 fp32 scales + 4 pad), so the ROCMI4 W4A4
+// vec_dot and write_back are reused verbatim.
+//
+// Ternary decode: element e of a block has value {-1,0,1}. The signed 4-bit tile
+// code is value+8 in {7,8,9} (bias so the nibble reads back as a signed int4).
+// One 128-element block maps to 16 data ints; MMQ_ITER_K=256 rows use 2 blocks.
+//
+// Per dword d (0..31), segment s=d/4, slot j=d%4 of that segment:
+//   byte b low  nibble = element 32s + 8*(j/2) + (j%2)*4 + b
+//   byte b high nibble = element 32s + 8*(j/2) + (j%2)*4 + 4 + b
+// (mirrors the ROCMI4 split-half loader layout that the i4_grid activation
+// packer emits.)
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0_w4a4(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0,
+        const int i_max, const int stride) {
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int warp_size = 32;
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+
+    // 44-int row: [32 data ints][8 fp32 scales][4 pad]; tile int d (0..31) holds elements
+    // 4d..4d+3 as signed-4bit two-complement nibbles (low nibble of byte b = elem 4d+b,
+    // high nibble = elem 4d+b+... see below), matching the i4_grid activation packer.
+    // One thread decodes one 128-element block into its 16 tile dwords, straight-line:
+    //   d 0..9  (elems 8d..8d+7 < 80):  qs bytes 8*(d&1)..+7 share pow3[d>>1]
+    //   d 10..14 (elems 80+8k..+7):     qs bytes 16..23 share pow3[d-10]
+    //   d 15    (elems 120..127):       qh alternates, pow3[t>>1]
+    const int txi = threadIdx.x % warp_size;
+    const int sub = txi % 2;                      // block within the 256-elem tile row
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += 16 * nwarps) {
+        int i = i0 + threadIdx.y * 16 + txi / 2;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_ptq1_0 * bx = (const block_ptq1_0 *) x + kbx0 + i * stride + sub;
+        int * row = x_tile + i * 44 + sub * 16;
+
+        int qw[6];
+#pragma unroll
+        for (int dw = 0; dw < 6; ++dw) {
+            memcpy(&qw[dw], bx->qs + 4 * dw, 4);  // 26-B blocks -> qs is not 4-byte aligned
+        }
+        uint16_t qhw;
+        memcpy(&qhw, bx->qh, 2);
+        const int qh0 = qhw & 0xFF;
+        const int qh1 = qhw >> 8;
+
+#pragma unroll
+        for (int d = 0; d < 15; ++d) {
+            const int lo_dw = d < 10 ? qw[2*(d & 1)] : qw[4];
+            const int hi_dw = d < 10 ? qw[2*(d & 1) + 1] : qw[5];
+            const int n = d < 10 ? (d >> 1) : (d - 10);
+            const uint32_t p3 = n == 0 ? 1u : n == 1 ? 3u : n == 2 ? 9u : n == 3 ? 27u : 81u;
+            const int lo = ptq1_0_decode4_same_trit(lo_dw, p3);
+            const int hi = ptq1_0_decode4_same_trit(hi_dw, p3);
+            row[d] = (lo & 0x0F0F0F0F) | ((hi & 0x0F0F0F0F) << 4);
+        }
+        {
+            int lo = 0;
+            int hi = 0;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int n0 = b >> 1;   // trit idx for elems 120+b
+                const uint32_t p3a = n0 == 0 ? 1u : n0 == 1 ? 3u : 9u;
+                const uint32_t p3b = (b + 4) >> 1 == 0 ? 1u : (b + 4) >> 1 == 1 ? 3u : (b + 4) >> 1 == 2 ? 9u : 27u;
+                lo |= (ptq1_0_trit_pow3((uint32_t) ((b & 1) ? qh1 : qh0), p3a) & 0xF) << (8 * b);
+                hi |= (ptq1_0_trit_pow3((uint32_t) ((b & 1) ? qh1 : qh0), p3b) & 0xF) << (8 * b);
+            }
+            row[15] = (lo & 0x0F0F0F0F) | ((hi & 0x0F0F0F0F) << 4);
+        }
+    }
+
+    // 8 scale slots per row: block 0's fp16 d into slots 0..3, block 1's into 4..7.
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps) {
+        int i = i0 + threadIdx.y;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+        const int slot = threadIdx.x % 8;
+        const block_ptq1_0 * bxi = (const block_ptq1_0 *) x + kbx0 + i * stride + slot / 4;
+        ((float *) (x_tile + i * 44 + 32))[slot] = bxi->d;
+    }
+}
+
 template <ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_rocmi4_w4a4(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
