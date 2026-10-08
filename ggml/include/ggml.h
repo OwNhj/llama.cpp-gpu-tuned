@@ -439,7 +439,10 @@ extern "C" {
         // so the ported sources compile unchanged.
         GGML_TYPE_Q4_0_ROCMI4       = 108, // native signed-nibble 4-bit + UE4M3 scale (no codebook)
         GGML_TYPE_Q4_0_SYM4         = 107, // same block, symmetric grid (n+0.5)*s -- no exact zero
-        GGML_TYPE_COUNT   = 109,
+        // Prism-private ternary family at group size 128 (type ids above all upstream types).
+        GGML_TYPE_PQ2_0  = 142, // Prism-private Q2_0 at group 128 (2.13 bpw)
+        GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary at group 128 (1.75 bpw)
+        GGML_TYPE_COUNT   = 144,
     };
 
     // [TAG_GGML_PREC]
@@ -495,6 +498,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PQ2_0  = 128, // except 1d tensors (Prism-private group-128 Q2_0)
+        GGML_FTYPE_MOSTLY_PTQ1_0 = 129, // except 1d tensors (Prism-private group-128 ternary)
         GGML_FTYPE_MOSTLY_Q4_0_ROCMI4           = 118, // native signed 4-bit integer path
         GGML_FTYPE_MOSTLY_Q4_0_SYM4              = 119, // symmetric 4-bit grid, 17 B block, 4.25 bpw
         GGML_FTYPE_MOSTLY_MXFP8   = 29, // except 1d tensors
