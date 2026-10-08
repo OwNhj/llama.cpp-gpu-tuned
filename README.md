@@ -23,6 +23,25 @@
 > `v_wmma_i32_16x16x32_iu4` tensor core, ported from [ROCmFPX](https://github.com/charlie12345/ROCmFPX)
 > and re-adapted to this tree's MMQ. See [RDNA4 I4 W4A4](#rdna4-i4-w4a4) below.
 >
+> ### Native quantized-KV flash attention on RDNA4
+>
+> The multi-warp WMMA FA path takes the K cache straight into the tensor core: `MXFP6`, `MXFP4`
+> and `NVFP4` K tiles are loaded as e4m3/i4 fragments and QK^T runs on native fp8 WMMA (no
+> dequantize-to-f16 on the K side; V still goes through the host-side f16 buffer). `BF16` KV is
+> the same story on the bf16 WMMA instruction: K loads natively, no f16 dequant. The path is
+> opt-in per type until it is the default: set `MXFP6_FATTN=1`, `MXFP4_FATTN=1`, `NVFP4_FATTN=1`
+> or `BF16_FATTN=1` (head-size limits per type are in `ggml_cuda_get_fattn_kernel`).
+>
+> ### Bonsai ternary quants: PTQ1_0 and PQ2_0
+>
+> The [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) 1.75/2.125 bpw ternary formats (from the [PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp)) are ported
+> end to end: ggml types 142/143, CPU dequant/vec_dot, the Hadamard rotation runtime and qwen35
+> wiring, plus MMVQ on every backend. On HIP/RDNA4 the **PTQ1_0 MMQ path is new work**: the port
+> source gates it to CUDA, so this fork adds branch-free int8 WMMA (default) and an opt-in i4
+> W4A4 (cmake `GGML_HIP_PTQ1_0_I4=ON`) loader pair - measured lossless on Qwen3.8-27B-PTQ1_0
+> (PPL 4.4823 vs the cuBLAS dequant path's 4.4845). `PQ2_0` runs on its existing CUDA/HIP-generic
+> MMQ loader and config entries, verified on RDNA4 with shape-bisection `test-backend-ops` cases.
+>
 > ### Calibration tooling in this fork
 
 This fork adds default-off offline quantization tooling: per-tensor quant error
