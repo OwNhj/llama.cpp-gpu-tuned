@@ -139,6 +139,71 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// Stage 32x32 tiles in shared memory: the load walks src1 along i1 and the store walks dst along
+// i0, so both sides stay contiguous. Reading src1 with the block on i1 and threads on i0 instead
+// would touch one element per sector, since src1's i0 stride is a whole row.
+template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+concat_transposed_dim0(
+        const char * __restrict__ src0,
+        const char * __restrict__ src1,
+              char * __restrict__ dst,
+        const int64_t ne00,
+        const int64_t ne10,
+        const int64_t ne11,
+        const int64_t ne2,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
+        const int64_t nb0,  const int64_t nb1,  const int64_t nb2,  const int64_t nb3) {
+    constexpr int TILE = 32;
+    constexpr int ROWS = 8;
+
+    __shared__ T tile[TILE][TILE + 1];
+
+    const int64_t z  = blockIdx.z;
+    const int64_t i2 = z % ne2;
+    const int64_t i3 = z / ne2;
+
+    const char * s0 = src0 + i3*nb03 + i2*nb02;
+    const char * s1 = src1 + i3*nb13 + i2*nb12;
+    char *       d  = dst  + i3*nb3  + i2*nb2;
+
+    const int64_t t0 = (int64_t) blockIdx.y * TILE;
+    const int64_t c0 = (int64_t) blockIdx.x * TILE;
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    // src0 is contiguous along i0 on both sides (only src1 is transposed), so copy it directly
+    #pragma unroll
+    for (int r = 0; r < TILE / ROWS; ++r) {
+        const int64_t c = c0 + ty + r*ROWS;
+        const int64_t t = t0 + tx;
+        if (c < ne11 && t < ne00) {
+            *(T *)(d + c*nb1 + t*nb0) = *(const T *)(s0 + c*nb01 + t*nb00);
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < TILE / ROWS; ++r) {
+        const int64_t t = t0 + ty + r*ROWS;
+        const int64_t c = c0 + tx;
+        if (t < ne10 && c < ne11) {
+            tile[ty + r*ROWS][tx] = *(const T *)(s1 + t*nb10 + c*nb11);
+        }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int r = 0; r < TILE / ROWS; ++r) {
+        const int64_t t = t0 + tx;
+        const int64_t c = c0 + ty + r*ROWS;
+        if (t < ne10 && c < ne11) {
+            *(T *)(d + c*nb1 + (ne00 + t)*nb0) = tile[tx][ty + r*ROWS];
+        }
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -162,6 +227,22 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        // dim == 0 where src1 is stored transposed relative to dst (only src1 can be, see above)
+        if (dim == 0 && dst->ne[1] >= 32 && src1->ne[0] >= 32 &&
+                src0->nb[0] == sizeof(T) && src1->nb[1] == sizeof(T) && dst->nb[0] == sizeof(T) &&
+                src1->nb[0] > src1->nb[1]) {
+            constexpr int TILE = 32;
+            const dim3 tgrid((dst->ne[1] + TILE - 1) / TILE, (src1->ne[0] + TILE - 1) / TILE, dst->ne[2]*dst->ne[3]);
+            const dim3 tblock(TILE, CUDA_CONCAT_BLOCK_SIZE / TILE, 1);
+            concat_transposed_dim0<T><<<tgrid, tblock, 0, stream>>>(
+                    (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                    src0->ne[0], src1->ne[0], src1->ne[1], dst->ne[2],
+                    src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                    src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                    dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+            return;
+        }
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
