@@ -2107,6 +2107,8 @@ bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t 
     // RDNA4-only W8A8 fp8 fast path for the MXFP4 weight prefill GEMM, aligned to radiance kernel limits:
     //   M(tokens) >= 256 (decode stays on MMQ/MMVQ), K % 64 == 0 (BK=64), N % 16 == 0 (n-tile).
     //   Env GGML_RAD_PREFILL_MIN_M overrides the threshold for tuning.
+    // Both MXFP4 types are zero-copy below this threshold: M <= 4 on the MMVQ plane vec_dot,
+    // M in [5,255] on the MMQ RAD tile loader, so neither pays an unrad rebuild.
     const int64_t min_m = getenv("GGML_RAD_PREFILL_MIN_M") ? atoll(getenv("GGML_RAD_PREFILL_MIN_M")) : 256;
     const bool type_ok = type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP4_RAD;
     return amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && type_ok &&

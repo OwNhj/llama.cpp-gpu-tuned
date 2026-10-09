@@ -341,6 +341,49 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     return d * sumi;
 }
 
+// MXFP4_RAD zero-copy MMVQ vec_dot: reads the interleaved code plane and the row-major scale
+// plane straight from the weight buffer, no unrad rebuild. vbq points at the tensor's code
+// plane; vbq_scale points at its scale plane (code plane base + nrows*nb*16, passed by caller).
+// kbx is the global block index (row*nb + b), which indexes both planes directly.
+//
+// Bit-exact vs vec_dot_mxfp4_q8_1 by construction: this thread reads the SAME 32 elements as
+// the split-half path (code word c holds elem[8c..8c+7], and (iqs>>1)+2*l maps iqs to the same
+// two words the split-half byte layout would), so the integer dp4a sum is identical and the
+// returned float partial matches element-for-element.
+static __device__ __forceinline__ float vec_dot_mxfp4_rad_q8_1(
+    const void * __restrict__ vbq, const void * __restrict__ vbq_scale,
+    const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const uint8_t * code = (const uint8_t *) vbq + (size_t) kbx * (QK_MXFP4 / 2);
+    const uint8_t   e    = ((const uint8_t *) vbq_scale)[kbx];
+
+    const int * q8 = (const int *) bq8_1->qs + iqs;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+        // interleaved code: word (iqs>>1)+2*l covers elem[8c..8c+7]. get_int_from_table_16
+        // returns v.x = even elems [e0,e2,e4,e6], v.y = odd elems [e1,e3,e5,e7]; re-interleave
+        // to natural order r0=[e0..e3], r1=[e4..e7] so each pairs with the matching q8 word.
+        const int aux_q4 = get_int_b1(code, (iqs >> 1) + 2*l);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+#if defined(GGML_USE_HIP)
+        // amdgcn_perm(a,b,sel): sel bytes 0-3 pick from b, 4-7 from a (opposite of __byte_perm).
+        // v.x = even elems, v.y = odd elems; interleave to natural order r0=[e0..e3], r1=[e4..e7].
+        const int r0 = (int) __builtin_amdgcn_perm((unsigned) v.y, (unsigned) v.x, 0x05010400u);
+        const int r1 = (int) __builtin_amdgcn_perm((unsigned) v.y, (unsigned) v.x, 0x07030602u);
+#else
+        const int r0 = __byte_perm(v.x, v.y, 0x5140);
+        const int r1 = __byte_perm(v.x, v.y, 0x7362);
+#endif
+        sumi = ggml_cuda_dp4a(r0, q8[4*l + 0], sumi);
+        sumi = ggml_cuda_dp4a(r1, q8[4*l + 1], sumi);
+    }
+
+    const float d = ggml_cuda_e8m0_to_fp32(e) * 0.5f * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
 #define VDR_NVFP4_Q8_1_MMVQ 4
 #define VDR_NVFP4_Q8_1_MMQ  8
 

@@ -12,7 +12,7 @@
 #define MMQ_ITER_K_FP4            512
 #define MMQ_NWARPS                8
 
-typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
+typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride, const int nrows_x);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
 typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
     float * __restrict__ dst, const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max);
@@ -419,7 +419,8 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q5_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q5_1:    return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
-        case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP4_RAD: return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_MXFP4_E4M3: return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q4_0_ROCMI4:     return MMQ_DP4A_TXS_Q8_0;
         // SYM4 has ROCMI4's exact 17-byte block and int8 tile shape.
@@ -727,6 +728,12 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                     ggml_cuda_mmq_load_tiles_mxfp4<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+            case GGML_TYPE_MXFP4_RAD:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_MXFP4_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_mxfp4_rad<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
             case GGML_TYPE_NVFP4:
                 return ggml_cuda_mmq_util_funcs(
                     VDR_NVFP4_Q8_1_MMQ,
@@ -921,6 +928,13 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_load_tiles_mxfp4_fp8<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/8>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_MXFP4_RAD:
+            // same fp8 tile geometry as MXFP4; the loader reads the radiance planes directly
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_mxfp4_rad<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_fp8_mma<type, J, fallback, /*x_scale_ints=*/8>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_NVFP4:
             // Back on the mainline int8 WMMA path (q8_0_16). NVFP4 keeps one UE4M3 scale per 16
             // elements, so its fp8 tile has to be 4 ints wide while MXFP4's 32-element scale
@@ -1040,7 +1054,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const int nrows_x) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
@@ -1094,7 +1108,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             // iteration k+1 can be hoisted by the scheduler ahead of the two vec_dots, and the
             // second vec_dot no longer waits on a load + barrier pair. Two barriers per
             // K-iteration instead of four.
-            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, nrows_x);
             {
                 // blocks_per_iter ITER_K/qk == 2 y-blocks per iteration: stage block kb0/4 into
                 // tile_y and block kb0/4+1 into tile_y2, then run both K-halves without a
@@ -1128,10 +1142,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 cp_async_cg_16<256>(
                     ggml_cuda_cvta_generic_to_shared(tile_y_bytes + byte0), by0 + byte0);
             }
-            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, nrows_x);
             cp_async_wait_all();
         } else {
-            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x, nrows_x);
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
@@ -1322,7 +1336,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, nrows_x);
         return;
     }
 
@@ -1416,7 +1430,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, nrows_x);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1500,7 +1514,7 @@ static __global__ void mul_mat_q(
     mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
          stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, nrows_x);
 }
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
@@ -1883,6 +1897,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 extern DECL_MMQ_CASE(GGML_TYPE_Q4_0_ROCMI4);
 // -----------------------------------------
 extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
+extern DECL_MMQ_CASE(GGML_TYPE_MXFP4_RAD);
 extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_MXFP4);
 extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);

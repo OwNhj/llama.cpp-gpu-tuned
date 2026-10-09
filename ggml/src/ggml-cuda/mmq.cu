@@ -11,7 +11,6 @@
 
 // --- MXFP4_RAD decode fallback helpers (definitions live in the radiance section below) ---
 struct ggml_radiance_weight;
-static unsigned char * ggml_rad_raw_copy(const unsigned char * src_rad, int N, int nb, cudaStream_t stream);
 
 
 // forward decls from radiance-gemm.cu (gfx1200 single TU build)
@@ -108,19 +107,14 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
             break;
         case GGML_TYPE_MXFP4_RAD:
-            {
-                const int64_t N = args.nrows_x;
-                const int64_t nb = args.ncols_x / 32;
-                unsigned char * raw = ggml_rad_raw_copy((const unsigned char *) args.x, (int)N, (int)nb, stream);
-                if (raw == nullptr) {
-                    // cache miss under graph capture: cannot allocate now, fail this path
-                    GGML_ABORT("RAD raw copy missing during capture");
-                }
-                mmq_args a2 = args;
-                a2.x = (const char *) raw;
-                a2.type_x = GGML_TYPE_MXFP4;
-                mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, a2, stream);
+            // zero-copy: the RAD tile loader reads the interleaved code plane and the row-major
+            // scale plane straight from args.x. the scale-plane offset assumes one contiguous
+            // [N, nb*16] code plane (2D tensor); MXFP4_RAD has no 3D/MoE producer, so abort
+            // instead of reading out of bounds.
+            if (args.nchannels_x != 1) {
+                GGML_ABORT("MXFP4_RAD MMQ only supports 2D tensors");
             }
+            mul_mat_q_case<GGML_TYPE_MXFP4_RAD>(ctx, args, stream);
             break;
         case GGML_TYPE_NVFP4:
             if (prec_src1 == GGML_PREC_Q4) {
@@ -153,27 +147,6 @@ struct ggml_radiance_weight {
 };
 
 static std::unordered_map<const void *, ggml_radiance_weight> g_radiance_weights;
-
-static unsigned char * ggml_rad_raw_copy(const unsigned char * src_rad, int N, int nb, cudaStream_t stream) {
-    static std::unordered_map<const unsigned char *, unsigned char *> g_rad_raw;
-    static int g_dev = -1;
-    const int dev = ggml_cuda_get_device();
-    auto it = g_rad_raw.find(src_rad);
-    if (it == g_rad_raw.end() || g_dev != dev) {
-        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
-        if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
-            return nullptr; // caller must handle
-        }
-        unsigned char * p = nullptr;
-        CUDA_CHECK(cudaMalloc(&p, (size_t)N * nb * 17));
-        radiance_unrad_kernel<<<N, 256, 0, stream>>>(src_rad, N, nb, p);
-        CUDA_CHECK(cudaGetLastError());
-        g_rad_raw[src_rad] = p;
-        g_dev = dev;
-        return p;
-    }
-    return it->second;
-}
 
 static void ggml_cuda_free_radiance_weights() {
     // W may point into the model weight buffer (MXFP4_RAD zero-copy); only owned

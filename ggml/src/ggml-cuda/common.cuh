@@ -1452,6 +1452,17 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int bs = sizeof(block_mxfp4);
 };
 
+// MXFP4_RAD stores split planes: a contiguous [N, nb*16] interleaved code plane followed by a
+// [N, nb] row-major e8m0 scale plane. Same qk/qi as MXFP4; bs is the code plane block stride
+// (16 B), used only to index the code plane. The scale plane sits at N*nb*16 (see the vec_dot).
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP4_RAD> {
+    static constexpr int qk = QK_MXFP4;
+    static constexpr int qr = QR_MXFP4;
+    static constexpr int qi = QI_MXFP4;
+    static constexpr int bs = QK_MXFP4 / 2;
+};
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
     static constexpr int qk = QK_NVFP4;

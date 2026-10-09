@@ -350,7 +350,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_fp8_mma(
     // fall back to the int8 loaders to match). MXFP8 is gated to RDNA4 in should_use_mmq.
     if constexpr (type == GGML_TYPE_NVFP4) {
         ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>(x, y, sum, k00);
-    } else if constexpr (type == GGML_TYPE_MXFP4) {
+    } else if constexpr (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP4_RAD) {
         ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>(x, y, sum, k00);
     } else {
         GGML_UNUSED_VARS(x, y, sum, k00);
