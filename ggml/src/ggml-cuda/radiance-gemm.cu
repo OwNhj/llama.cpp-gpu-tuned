@@ -1980,9 +1980,13 @@ __global__ void radiance_repack_kernel(const char * __restrict__ src, int64_t s0
 //   same persistent q buffer. ffn_gate and ffn_up read one and the same activation, so the second
 //   GEMM of the pair skips the pass. Device-side check only: graph-capture safe, worst case one
 //   redundant requantize, and a hash collision can only reuse a stale-but-equal row.
+//
+// NIT > 0 holds the row in registers so the amax scan and the quantize pass share one global
+// read; it needs K <= blockDim.x * 4 * NIT. NIT == 0 keeps the two-pass form for larger K.
+template <int NIT>
 __global__ void quantize_tokens_fp8(const float * __restrict__ x, int64_t sx, int64_t K,
-                                     unsigned char * __restrict__ q, float * __restrict__ scale,
-                                     uint2 * __restrict__ row_hash) {
+                                    unsigned char * __restrict__ q, float * __restrict__ scale,
+                                    uint2 * __restrict__ row_hash) {
     const int64_t row = blockIdx.y;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
@@ -2009,12 +2013,24 @@ __global__ void quantize_tokens_fp8(const float * __restrict__ x, int64_t sx, in
     if (tid == 0) {
         row_hash[row] = h;
     }
+    float4 v[NIT > 0 ? NIT : 1];
     float local = 0.0f;
-    for (int64_t k = tid * 4; k < K; k += (int64_t)nthreads * 4) {
-        const float4 v = *(const float4 *)(xr + k);
-        local = fmaxf(local, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+    if (NIT > 0) {
+#pragma unroll
+        for (int i = 0; i < NIT; ++i) {
+            const int64_t k = (int64_t)(tid + i * nthreads) * 4;
+            if (k < K) {
+                v[i] = *(const float4 *)(xr + k);
+                local = fmaxf(local, fmaxf(fmaxf(fabsf(v[i].x), fabsf(v[i].y)), fmaxf(fabsf(v[i].z), fabsf(v[i].w))));
+            }
+        }
+    } else {
+        for (int64_t k = tid * 4; k < K; k += (int64_t)nthreads * 4) {
+            const float4 t = *(const float4 *)(xr + k);
+            local = fmaxf(local, fmaxf(fmaxf(fabsf(t.x), fabsf(t.y)), fmaxf(fabsf(t.z), fabsf(t.w))));
+        }
     }
-    __shared__ float sh[8];
+    __shared__ float sh[32];
     for (int off = 16; off > 0; off >>= 1)
         local = fmaxf(local, __shfl_xor(local, off));
     if ((tid & 31) == 0) sh[tid >> 5] = local;
@@ -2032,12 +2048,25 @@ __global__ void quantize_tokens_fp8(const float * __restrict__ x, int64_t sx, in
     const int64_t Kt = K >> 4;
     const int64_t frag_row = (row >> 4) * Kt;
     const int lrow = (int)(row & 15);
-    for (int64_t k = tid * 4; k < K; k += (int64_t)nthreads * 4) {
-        const float4 v = *(const float4 *)(xr + k);
-        const uint32_t p0 = ggml_cuda_fp32x2_to_e4m3x2(v.x * dinv, v.y * dinv);
-        const uint32_t p1 = ggml_cuda_fp32x2_to_e4m3x2(v.z * dinv, v.w * dinv);
-        const int64_t pos = (frag_row + (k >> 4)) * 256 + (lrow + 16 * ((int)((k >> 3) & 1))) * 8 + (k & 7);
-        *(uint32_t *)(q + pos) = (p0 & 0xFFFFu) | ((p1 & 0xFFFFu) << 16);
+    if (NIT > 0) {
+#pragma unroll
+        for (int i = 0; i < NIT; ++i) {
+            const int64_t k = (int64_t)(tid + i * nthreads) * 4;
+            if (k < K) {
+                const uint32_t p0 = ggml_cuda_fp32x2_to_e4m3x2(v[i].x * dinv, v[i].y * dinv);
+                const uint32_t p1 = ggml_cuda_fp32x2_to_e4m3x2(v[i].z * dinv, v[i].w * dinv);
+                const int64_t pos = (frag_row + (k >> 4)) * 256 + (lrow + 16 * ((int)((k >> 3) & 1))) * 8 + (k & 7);
+                *(uint32_t *)(q + pos) = (p0 & 0xFFFFu) | ((p1 & 0xFFFFu) << 16);
+            }
+        }
+    } else {
+        for (int64_t k = tid * 4; k < K; k += (int64_t)nthreads * 4) {
+            const float4 t = *(const float4 *)(xr + k);
+            const uint32_t p0 = ggml_cuda_fp32x2_to_e4m3x2(t.x * dinv, t.y * dinv);
+            const uint32_t p1 = ggml_cuda_fp32x2_to_e4m3x2(t.z * dinv, t.w * dinv);
+            const int64_t pos = (frag_row + (k >> 4)) * 256 + (lrow + 16 * ((int)((k >> 3) & 1))) * 8 + (k & 7);
+            *(uint32_t *)(q + pos) = (p0 & 0xFFFFu) | ((p1 & 0xFFFFu) << 16);
+        }
     }
 }
 
@@ -2193,7 +2222,12 @@ void ggml_cuda_radiance_quantize_tokens(const float * x, int64_t sx, int64_t K, 
         return;
     }
     const dim3 grid(1, (unsigned) M);
-    quantize_tokens_fp8<<<grid, 256, 0, stream>>>(x, sx, K, b.q, b.scale, b.hashes);
+    constexpr int QNTH = 256, QNIT = 5;
+    if (K <= (int64_t) QNTH * 4 * QNIT) {
+        quantize_tokens_fp8<QNIT><<<grid, QNTH, 0, stream>>>(x, sx, K, b.q, b.scale, b.hashes);
+    } else {
+        quantize_tokens_fp8<0><<<grid, QNTH, 0, stream>>>(x, sx, K, b.q, b.scale, b.hashes);
+    }
     *q = b.q; *scale = b.scale;
 }
 
