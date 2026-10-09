@@ -235,13 +235,13 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
         const size_t wref_bytes = (size_t)N;
         if (src0->type == GGML_TYPE_MXFP4_RAD) {
             w.own_w = false;   // W aliases the weight buffer (full-plane rad2 layout)
-            // RAD rows are [nb*16 codes][nb scales] interleaved per row; the GEMM wants
-            // a contiguous W code plane, Ws[b*N+n] scale plane and Wref row-max. Build all
-            // three once from the weight buffer (scales/copies are small vs a full repack).
+            // zero-copy: the atiled RADSC path reads the row-major scale plane straight from
+            // the weight buffer (W + N*K/2), so no transposed Ws is allocated. Wref (row max
+            // exponent, N bytes) still comes from the gather pass with Ws == nullptr.
             w.W = (unsigned char *) src0->data;   // code plane aliases the weight buffer
-            CUDA_CHECK(cudaMalloc(&w.Ws,   ws_bytes));
+            w.Ws = nullptr;
             CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
-            ggml_cuda_radiance_gather_scales((const unsigned char *) src0->data, N, K, (unsigned char *) w.Ws, (unsigned char *) w.Wref, stream);
+            ggml_cuda_radiance_gather_scales((const unsigned char *) src0->data, N, K, nullptr, (unsigned char *) w.Wref, stream);
         } else {
             CUDA_CHECK(cudaMalloc(&w.W,    wq_bytes));
             CUDA_CHECK(cudaMalloc(&w.Ws,   ws_bytes));
@@ -265,7 +265,8 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
     }
 
     ggml_cuda_radiance_gemm_f32(q8, w.W, w.Ws, w.Wref, as,
-                                (float *) dst->data, (int) M, (int) N, (int) K, stream);
+                                (float *) dst->data, (int) M, (int) N, (int) K, stream,
+                                src0->type == GGML_TYPE_MXFP4_RAD);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

@@ -564,7 +564,7 @@ static __device__ __forceinline__ void radiance_lds_barrier() {
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
-template <int TN, bool WPERM, int LBK = BK, bool E6 = false, bool F32OUT = false>
+template <int TN, bool WPERM, int LBK = BK, bool E6 = false, bool F32OUT = false, bool RADSC = false>
 __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
@@ -579,6 +579,9 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
   __shared__ unsigned char sW[BNF_T * LWSTR];
   __shared__ unsigned int sMag[32];   // kMag, 128 B: ds_load keeps the lookup off the loadcnt chain
   __shared__ unsigned int sTab[7 * 4];
+  constexpr int NSC = LBK / 32;
+  __shared__ unsigned char sS[BNF_T * NSC];   // RADSC: staged slab scales (row-major source -> LDS)
+
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int wm = wave / WN, wn = wave % WN;
@@ -695,12 +698,34 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
       }
     } else {
       const unsigned char *__restrict__ Wb = W + (size_t)__builtin_amdgcn_readfirstlane((int)(((size_t)n0 * K + k0) / 2));
-      const unsigned char *__restrict__ Wsb = Ws + (size_t)__builtin_amdgcn_readfirstlane((k0 / 32) * N + n0);
+      if constexpr (RADSC) {
+        // MXFP4_RAD: no transposed Ws. stage this slab's BNF_T x NSC scale bytes from the
+        // row-major plane (right after the [N, K/2] code plane W aliases) into LDS: one byte
+        // per thread per slab instead of NW strided reads per thread. sS rows are clamped
+        // like the W loads. Barrier before the fold loop reads sS (written by other threads).
+        const unsigned char *__restrict__ Sc = W + (size_t)N * (K / 2) + (size_t)k0 / 32;
 #pragma unroll
-      for (int it = 0; it < NW; ++it) {
-        const uint2_t v = *(const uint2_t *)(Wb + (unsigned int)(wrc[it] * (K / 2) + wcol[it]));
-        pk[it] = uint4_t{v[0], v[1], 0u, 0u};
-        wsv[it] = Wsb[(unsigned int)(((wcol[it] * 2) / 32) * N + wrc[it])];
+        for (int it = 0; it < NW; ++it) {
+          const uint2_t v = *(const uint2_t *)(Wb + (unsigned int)(wrc[it] * (K / 2) + wcol[it]));
+          pk[it] = uint4_t{v[0], v[1], 0u, 0u};
+        }
+        for (int idx = tid; idx < BNF_T * NSC; idx += NTHREADS) {
+          const int r = idx / NSC, c = idx - r * NSC;
+          const int rcl = n0 + r < N ? r : N - 1 - n0;
+          sS[idx] = Sc[(size_t)(n0 + rcl) * (K / 32) + c];
+        }
+        radiance_lds_barrier();
+#pragma unroll
+        for (int it = 0; it < NW; ++it)
+          wsv[it] = sS[(size_t)wrow[it] * NSC + (unsigned int)((wcol[it] * 2) / 32)];
+      } else {
+        const unsigned char *__restrict__ Wsb = Ws + (size_t)__builtin_amdgcn_readfirstlane((k0 / 32) * N + n0);
+#pragma unroll
+        for (int it = 0; it < NW; ++it) {
+          const uint2_t v = *(const uint2_t *)(Wb + (unsigned int)(wrc[it] * (K / 2) + wcol[it]));
+          pk[it] = uint4_t{v[0], v[1], 0u, 0u};
+          wsv[it] = Wsb[(unsigned int)(((wcol[it] * 2) / 32) * N + wrc[it])];
+        }
       }
     }
     if constexpr (WPERM) {
@@ -1962,7 +1987,7 @@ __global__ void radiance_gather_scales_kernel(const unsigned char * __restrict__
     uint8_t lmax = 0;
     for (int b = tid; b < nb; b += stride) {
         const uint8_t e = sc[b];
-        Ws[(int64_t)b * gridDim.x + n] = e;
+        if (Ws != nullptr) Ws[(int64_t)b * gridDim.x + n] = e;   // Wref-only build: null Ws ok
         if (e > lmax) lmax = e;
     }
     __shared__ uint8_t shmax[256];
@@ -2073,33 +2098,28 @@ void ggml_cuda_radiance_quantize_tokens(const float * x, int64_t sx, int64_t K, 
 }
 
 static void launch_at_f32(uintptr_t at, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
-                          uintptr_t cf, int M, int N, int K, uintptr_t stream) {
+                          uintptr_t cf, int M, int N, int K, uintptr_t stream, bool radsc) {
     dim3 fblock(NTHREADS);
     if (M >= 2048 && N >= BNF_OF(4)) {
         constexpr int B_ = BNF_OF(4);
         dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);
-        hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, 64, false, true>),
-                           fgrid, fblock, 0, (hipStream_t)stream,
-                           (const unsigned char *)at, (const unsigned char *)w,
-                           (const unsigned char *)ws, (const unsigned char *)wref,
-                           (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0,
-                           (const unsigned char *)nullptr, (float *)cf);
+#define RAD_LAUNCH_AT4(RS_)         hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, 64, false, true, RS_>),                            fgrid, fblock, 0, (hipStream_t)stream,                            (const unsigned char *)at, (const unsigned char *)w,                            (const unsigned char *)ws, (const unsigned char *)wref,                            (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0,                            (const unsigned char *)nullptr, (float *)cf)
+        if (radsc) RAD_LAUNCH_AT4(true); else RAD_LAUNCH_AT4(false);
+#undef RAD_LAUNCH_AT4
     } else {
         constexpr int B_ = BNF_OF(2);
         dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);
-        hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<2, false, 128, false, true>),
-                           fgrid, fblock, 0, (hipStream_t)stream,
-                           (const unsigned char *)at, (const unsigned char *)w,
-                           (const unsigned char *)ws, (const unsigned char *)wref,
-                           (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0,
-                           (const unsigned char *)nullptr, (float *)cf);
+#define RAD_LAUNCH_AT2(RS_)         hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<2, false, 128, false, true, RS_>),                            fgrid, fblock, 0, (hipStream_t)stream,                            (const unsigned char *)at, (const unsigned char *)w,                            (const unsigned char *)ws, (const unsigned char *)wref,                            (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0,                            (const unsigned char *)nullptr, (float *)cf)
+        if (radsc) RAD_LAUNCH_AT2(true); else RAD_LAUNCH_AT2(false);
+#undef RAD_LAUNCH_AT2
     }
 }
 
 void ggml_cuda_radiance_gemm_f32(const void * a_q, const void * w, const void * ws, const void * wref,
-                                 const float * as, float * c, int M, int N, int K, cudaStream_t stream) {
+                                 const float * as, float * c, int M, int N, int K, cudaStream_t stream,
+                                 bool radsc) {
     launch_at_f32((uintptr_t) a_q, (uintptr_t) w, (uintptr_t) ws, (uintptr_t) wref,
-                  (uintptr_t) as, (uintptr_t) c, M, N, K, (uintptr_t) stream);
+                  (uintptr_t) as, (uintptr_t) c, M, N, K, (uintptr_t) stream, radsc);
 }
 
 bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t ne01,
