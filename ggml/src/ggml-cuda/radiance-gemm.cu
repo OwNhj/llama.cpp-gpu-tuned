@@ -580,33 +580,35 @@ static __device__ __forceinline__ void radiance_lds_barrier() {
 }
 
 template <int TN, bool WPERM, int LBK = BK, bool E6 = false, bool F32OUT = false, bool RADSC = false,
-          bool E6PACK = false>
-__global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
+          bool E6PACK = false, int TWM = WM, int TWN = WN>
+__global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
     const float *__restrict__ As, __bf16 *__restrict__ C, int M, int N, int K,
     int pb1, int pb2, long astride, const unsigned char *__restrict__ WH = nullptr,
     float *__restrict__ Cf = nullptr) {
+  constexpr int NTHREADS_T = TWM * TWN * 32;
+  constexpr int BMF_T = TWM * TM * 16;
   constexpr int NS = LBK / 16;
   constexpr int LWSTR = LBK + PAD;
-  constexpr int BNF_T = WN * TN * 16;
-  constexpr int NIT = BNF_T * LBK / 2 / (NTHREADS * 8);   // row-major W staging iterations per slab
-  static_assert(NIT >= 1 && NIT * NTHREADS * 8 == BNF_T * LBK / 2, "W tile must be 8 B/thread multiples");
+  constexpr int BNF_T = TWN * TN * 16;
+  constexpr int NIT = BNF_T * LBK / 2 / (NTHREADS_T * 8);   // row-major W staging iterations per slab
+  static_assert(NIT >= 1 && NIT * NTHREADS_T * 8 == BNF_T * LBK / 2, "W tile must be 8 B/thread multiples");
   __shared__ unsigned char sW[BNF_T * LWSTR];
   __shared__ unsigned int sMag[32];   // kMag, 128 B: ds_load keeps the lookup off the loadcnt chain
   __shared__ unsigned int sTab[7 * 4];
 
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
-  const int wm = wave / WN, wn = wave % WN;
+  const int wm = wave / TWN, wn = wave % TWN;
   const int col = lane & 15, kb8 = (lane >> 4) * 8;
   // Dispatch m fastest, so the resident blocks cover every m-block at once and the whole A
   // matrix stays cached while the W slabs stream past it. A linear id keeps coverage exact:
   // every (m, n) pair is still visited once. Worth -3.4% on the prefill GEMM (858 -> 831 ms,
   // same interleaved A/B as above).
-  const int mb_count = (M + BMF - 1) / BMF;
+  const int mb_count = (M + BMF_T - 1) / BMF_T;
   const int bid_ = blockIdx.y * gridDim.x + blockIdx.x;
-  const int m0 = (bid_ % mb_count) * BMF, n0 = (bid_ / mb_count) * BNF_T;
+  const int m0 = (bid_ % mb_count) * BMF_T, n0 = (bid_ / mb_count) * BNF_T;
   // Merged-linear partition select (paroquant: one launch over the whole N, partition p's n-blocks
   // read the p-th rotated copy of A and its scales). Boundaries are multiples of every n-tile
   // (launcher-checked), so a block never straddles one. pb1 = pb2 = 1<<30 (the default) is p = 0.
@@ -646,15 +648,15 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
   //   (N % 16 == 0 under WPERM) so the vector read stays aligned and every gc + q is in bounds.
   constexpr int KSTEPS_T = LBK / 16, NTILES_T = BNF_T / 16;
   constexpr int TOT_SLOTS = NTILES_T * KSTEPS_T * 32;
-  constexpr int WSLOTS = (TOT_SLOTS >= NTHREADS * 4) ? 4 : 2;
-  constexpr int NITW = TOT_SLOTS / (NTHREADS * WSLOTS);
-  static_assert(!WPERM || NITW * NTHREADS * WSLOTS == TOT_SLOTS, "WPERM slot groups must tile");
+  constexpr int WSLOTS = (TOT_SLOTS >= NTHREADS_T * 4) ? 4 : 2;
+  constexpr int NITW = TOT_SLOTS / (NTHREADS_T * WSLOTS);
+  static_assert(!WPERM || NITW * NTHREADS_T * WSLOTS == TOT_SLOTS, "WPERM slot groups must tile");
   constexpr int NW = WPERM ? NITW : NIT;
   int wrow[NW], wcol[NW], wrc[NW], wkst[NW], wlanec[NW];
 #pragma unroll
   for (int it = 0; it < NW; ++it) {
     if constexpr (WPERM) {
-      const int sl = it * NTHREADS * WSLOTS + tid * WSLOTS;
+      const int sl = it * NTHREADS_T * WSLOTS + tid * WSLOTS;
       const int lane_ = sl & 31, rest = sl >> 5;
       const int kst = rest % KSTEPS_T, ntl = rest / KSTEPS_T;
       wrow[it] = ntl * 16 + (lane_ & 15);
@@ -666,14 +668,14 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
     } else if constexpr (E6PACK) {
       // MXFP6 packed: one iteration is a 16-element group = 12 packed bytes, so wcol is the
       // group's ELEMENT base in [0, LBK) rather than a 4-bit byte column. The group count
-      // BNF_T*LBK/16 equals NIT*NTHREADS, so the iteration count is unchanged.
-      const int g = it * NTHREADS + tid;
+      // BNF_T*LBK/16 equals NIT*NTHREADS_T, so the iteration count is unchanged.
+      const int g = it * NTHREADS_T + tid;
       wrow[it] = g / (LBK / 16);
       wcol[it] = (g % (LBK / 16)) * 16;
       wrc[it] = wrow[it] < N - 1 - n0 ? wrow[it] : N - 1 - n0;
       wkst[it] = 0; wlanec[it] = 0;
     } else {
-      const int idx = it * NTHREADS * 8 + tid * 8;
+      const int idx = it * NTHREADS_T * 8 + tid * 8;
       wrow[it] = idx / (LBK / 2); wcol[it] = idx % (LBK / 2);
       wrc[it] = wrow[it] < N - 1 - n0 ? wrow[it] : N - 1 - n0;
       wkst[it] = 0; wlanec[it] = 0;
@@ -2234,16 +2236,22 @@ void ggml_cuda_radiance_quantize_tokens(const float * x, int64_t sx, int64_t K, 
 static void launch_at_f32(uintptr_t at, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
                           uintptr_t cf, int M, int N, int K, uintptr_t stream, bool radsc,
                           bool e6pack = false) {
+    // TN=4 uses a 8x1 wave tile: 512 wide in M, 64 wide in N. This trades A rereads for W
+    // rereads, which pays here because A is small and stays in cache while W streams from
+    // DRAM: at M=2048/N=6144/K=5120 the A stream grows 503 -> 1007 MB (still well inside the
+    // 64 MB MALL, and it was already re-read 48 times) while the W stream halves 126 -> 63 MB.
+    // Measured over a pp2048 pass, interleaved A/B, 3 rounds, non-overlapping: 817.1/818.5/
+    // 820.7 -> 783.7/787.3/788.8 ms (-4.0%), and +2.0% end to end on pp2048.
+    // TN=2 keeps the 4x2 default: it has few enough blocks that the wider M tile starves it.
+    // E6PACK keeps LBK=64: its MXFP6 group load regressed +6% at 128.
+    constexpr int TWM4 = 8, TWN4 = 1;
+    constexpr int B4_ = TWN4 * 4 * 16;
+    constexpr int BMF4_ = TWM4 * TM * 16;
+    static_assert(TWM4 * TWN4 * 32 == NTHREADS, "fblock below assumes the TN=4 tile keeps NWAVE waves");
     dim3 fblock(NTHREADS);
-    if (M >= 2048 && N >= BNF_OF(4)) {
-        constexpr int B_ = BNF_OF(4);
-        dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);
-// RADSC runs LBK=128. Each K slab costs two LDS barriers, so doubling the slab width
-// halves the barrier count over the whole K loop. Measured on the prefill GEMM over a
-// pp2048 pass, interleaved A/B, 4 rounds, non-overlapping distributions: 898 -> 858 ms
-// (-4.6%). E6PACK keeps LBK=64: its MXFP6 group load regressed +6% at 128. VGPR rises
-// 216 -> 240 and LDS 9.7 -> 18.4 KB, so occupancy stays at 3 blocks/CU either way.
-#define RAD_LAUNCH_AT4(RS_, E6P_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, (E6P_ ? 64 : 128), false, true, RS_, E6P_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
+    if (M >= 2048 && N >= B4_) {
+        dim3 fgrid((N + B4_ - 1) / B4_, (M + BMF4_ - 1) / BMF4_);
+#define RAD_LAUNCH_AT4(RS_, E6P_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, (E6P_ ? 64 : 128), false, true, RS_, E6P_, TWM4, TWN4>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
         if (e6pack) RAD_LAUNCH_AT4(false, true); else if (radsc) RAD_LAUNCH_AT4(true, false); else RAD_LAUNCH_AT4(false, false);
 #undef RAD_LAUNCH_AT4
     } else {
