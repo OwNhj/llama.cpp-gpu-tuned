@@ -595,14 +595,18 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
   __shared__ unsigned char sW[BNF_T * LWSTR];
   __shared__ unsigned int sMag[32];   // kMag, 128 B: ds_load keeps the lookup off the loadcnt chain
   __shared__ unsigned int sTab[7 * 4];
-  constexpr int NSC = LBK / 32;
-  __shared__ unsigned char sS[BNF_T * NSC];   // RADSC: staged slab scales (row-major source -> LDS)
 
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
   const int wm = wave / WN, wn = wave % WN;
   const int col = lane & 15, kb8 = (lane >> 4) * 8;
-  const int m0 = blockIdx.y * BMF, n0 = blockIdx.x * BNF_T;
+  // Dispatch m fastest, so the resident blocks cover every m-block at once and the whole A
+  // matrix stays cached while the W slabs stream past it. A linear id keeps coverage exact:
+  // every (m, n) pair is still visited once. Worth -3.4% on the prefill GEMM (858 -> 831 ms,
+  // same interleaved A/B as above).
+  const int mb_count = (M + BMF - 1) / BMF;
+  const int bid_ = blockIdx.y * gridDim.x + blockIdx.x;
+  const int m0 = (bid_ % mb_count) * BMF, n0 = (bid_ / mb_count) * BNF_T;
   // Merged-linear partition select (paroquant: one launch over the whole N, partition p's n-blocks
   // read the p-th rotated copy of A and its scales). Boundaries are multiples of every n-tile
   // (launcher-checked), so a block never straddles one. pb1 = pb2 = 1<<30 (the default) is p = 0.
@@ -757,25 +761,17 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
     } else {
       const unsigned char *__restrict__ Wb = W + (size_t)__builtin_amdgcn_readfirstlane((int)(((size_t)n0 * K + k0) / 2));
       if constexpr (RADSC) {
-        // MXFP4_RAD: no transposed Ws. stage this slab's BNF_T x NSC scale bytes from the
-        // row-major plane (right after the [N, K/2] code plane W aliases) into LDS: one byte
-        // per thread per slab instead of NW strided reads per thread. sS rows are clamped
-        // like the W loads. Barrier before the fold loop reads sS (written by other threads).
+        // Read each fragment's scale straight from the global scale plane instead of staging
+        // the slab through sS, which removes the barrier that staging needed. The row sS would
+        // have used for row r is min(n0 + r, N - 1), the same clamp the W loads already apply.
         const unsigned char *__restrict__ Sc = W + (size_t)N * (K / 2) + (size_t)k0 / 32;
 #pragma unroll
         for (int it = 0; it < NW; ++it) {
           const uint2_t v = *(const uint2_t *)(Wb + (unsigned int)(wrc[it] * (K / 2) + wcol[it]));
           pk[it] = uint4_t{v[0], v[1], 0u, 0u};
+          const int grow = n0 + wrow[it] < N ? n0 + wrow[it] : N - 1;
+          wsv[it] = Sc[(size_t)grow * (K / 32) + (unsigned int)((wcol[it] * 2) / 32)];
         }
-        for (int idx = tid; idx < BNF_T * NSC; idx += NTHREADS) {
-          const int r = idx / NSC, c = idx - r * NSC;
-          const int rcl = n0 + r < N ? r : N - 1 - n0;
-          sS[idx] = Sc[(size_t)(n0 + rcl) * (K / 32) + c];
-        }
-        radiance_lds_barrier();
-#pragma unroll
-        for (int it = 0; it < NW; ++it)
-          wsv[it] = sS[(size_t)wrow[it] * NSC + (unsigned int)((wcol[it] * 2) / 32)];
       } else {
         const unsigned char *__restrict__ Wsb = Ws + (size_t)__builtin_amdgcn_readfirstlane((k0 / 32) * N + n0);
 #pragma unroll
@@ -1879,7 +1875,7 @@ static void launch_at_impl(uintptr_t a, uintptr_t w, uintptr_t ws, uintptr_t wre
   do {                                                                                          \
     constexpr int B_ = BNF_OF(TN_);                                                             \
     dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);                                         \
-    hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<TN_, WP_, (TN_ == 2 ? 128 : 64), E6_>), \
+    hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<TN_, WP_, (TN_ == 2 ? 128 : (E6_ ? 64 : 128)), E6_>), \
                        fgrid, fblock, 0,                                                        \
                        (hipStream_t)stream, (const unsigned char *)a, (const unsigned char *)w, \
                        (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, \
@@ -2208,7 +2204,12 @@ static void launch_at_f32(uintptr_t at, uintptr_t w, uintptr_t ws, uintptr_t wre
     if (M >= 2048 && N >= BNF_OF(4)) {
         constexpr int B_ = BNF_OF(4);
         dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);
-#define RAD_LAUNCH_AT4(RS_, E6P_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, 64, false, true, RS_, E6P_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
+// RADSC runs LBK=128. Each K slab costs two LDS barriers, so doubling the slab width
+// halves the barrier count over the whole K loop. Measured on the prefill GEMM over a
+// pp2048 pass, interleaved A/B, 4 rounds, non-overlapping distributions: 898 -> 858 ms
+// (-4.6%). E6PACK keeps LBK=64: its MXFP6 group load regressed +6% at 128. VGPR rises
+// 216 -> 240 and LDS 9.7 -> 18.4 KB, so occupancy stays at 3 blocks/CU either way.
+#define RAD_LAUNCH_AT4(RS_, E6P_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, (E6P_ ? 64 : 128), false, true, RS_, E6P_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
         if (e6pack) RAD_LAUNCH_AT4(false, true); else if (radsc) RAD_LAUNCH_AT4(true, false); else RAD_LAUNCH_AT4(false, false);
 #undef RAD_LAUNCH_AT4
     } else {
