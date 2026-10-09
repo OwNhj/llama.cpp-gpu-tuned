@@ -727,6 +727,13 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
       // from the source block's own e[] tail, past the 192-byte qs region of that block.
       // A group never straddles a block (256/16 == 16 groups per block), so one group sees
       // exactly one sub-block scale.
+      //
+      // Measured alternative (2026-10-09): pairing two adjacent groups per thread so the 24 B
+      // read is 8-byte aligned and shares one scale and one kE2M3 row. Net zero end to end at
+      // pp2048: TN=4 shapes gained ~1.1 ms (684.7 vs 690.9/693.0 us) while the TN=2 N=64 shape
+      // lost ~1.2 ms (53.8 vs 47.6 us), because that shape is launch-bound, not load-bound.
+      // The 29% gap to RADSC is the format itself (6.25 vs 4.53 bpw); E6PACK already streams
+      // more bytes per second (283.7 vs 248.7 GB/s), so the width of the load is not the limit.
       const size_t blk_row_bytes = (size_t) (K / QK_MXFP6) * sizeof(block_mxfp6);
       const unsigned char *__restrict__ Wb =
           W + (size_t) __builtin_amdgcn_readfirstlane((int) ((size_t) n0 * blk_row_bytes));
@@ -2249,12 +2256,15 @@ __global__ void swiglu_quant_fused_kernel(
         const float * __restrict__ gate, const float * __restrict__ up,
         float * __restrict__ y, unsigned char * __restrict__ q,
         float * __restrict__ scale, uint2 * __restrict__ row_hash,
-        int64_t N, int64_t M) {
+        int64_t N, int64_t M, int64_t gs, int64_t us) {
     const int64_t row = blockIdx.y;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
-    const float * gr = gate + row * N;
-    const float * ur = up + row * N;
+    // gs/us are the gate/up row strides in floats. A fused gate_up GEMM hands both out as views
+    // of one [2N, M] result, so the stride is 2N and up starts N floats into the row. Two separate
+    // gate/up GEMMs give stride N each. y stays the GLU output, always N wide.
+    const float * gr = gate + row * gs;
+    const float * ur = up + row * us;
     float * yr = y + row * N;
 
     // (gate, up) row signature: 64 strided samples each, one thread per sample pair.
@@ -2348,7 +2358,7 @@ bool ggml_rad_fused_act_lookup(const void * act, int64_t K,
 
 // true when dst was handled (y written, q produced and registered).
 bool ggml_cuda_try_swiglu_quant_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
-    if (getenv("GGML_RAD_DISABLE")) {
+    if (getenv("GGML_RAD_DISABLE") || getenv("GGML_RAD_FUSE_OFF")) {
         return false;
     }
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2358,20 +2368,48 @@ bool ggml_cuda_try_swiglu_quant_fused(ggml_backend_cuda_context & ctx, const ggm
     const ggml_tensor * gate = dst->src[0];
     const ggml_tensor * up   = dst->src[1];
     if (!gate || !up || dst->type != GGML_TYPE_F32 ||
-        gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
-        gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT) {
+        gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32) {
         return false;
     }
-    if (!gate->src[0] || !up->src[0] ||
-        gate->src[0]->type != GGML_TYPE_MXFP4 || up->src[0]->type != GGML_TYPE_MXFP4) {
+    // gate/up are either two separate GEMM results or two views of one fused gate_up GEMM result
+    // (Qwen3.5 FFN). Walk through the view so a fused gate_up is accepted too. The kernel only
+    // needs each operand's row stride, since a view's data already carries its own offset.
+    const auto gemm_src = [](const ggml_tensor * t) -> const ggml_tensor * {
+        if (t->op == GGML_OP_MUL_MAT) {
+            return t;
+        }
+        if (t->op == GGML_OP_VIEW && t->view_src != nullptr && t->view_src->op == GGML_OP_MUL_MAT) {
+            return t->view_src;
+        }
+        return nullptr;
+    };
+    const ggml_tensor * gsrc = gemm_src(gate);
+    const ggml_tensor * usrc = gemm_src(up);
+    if (!gsrc || !usrc || !gsrc->src[0] || !usrc->src[0]) {
+        return false;
+    }
+    // the weights must be a radiance type, else the downstream down-GEMM cannot consume q.
+    const auto rad_type = [](ggml_type t) {
+        return t == GGML_TYPE_MXFP4 || t == GGML_TYPE_MXFP4_RAD;
+    };
+    if (!rad_type(gsrc->src[0]->type) || !rad_type(usrc->src[0]->type)) {
         return false;
     }
     const int64_t N = dst->ne[0];
     const int64_t M = dst->ne[1];
     const int64_t min_m = getenv("GGML_RAD_PREFILL_MIN_M") ? atoll(getenv("GGML_RAD_PREFILL_MIN_M")) : 256;
-    if (N % 64 != 0 || M < min_m || dst->ne[2] != 1 ||
-        gate->nb[1] != N * (int64_t) sizeof(float) || up->nb[1] != N * (int64_t) sizeof(float) ||
-        dst->nb[1] != N * (int64_t) sizeof(float)) {
+    if (N % 64 != 0 || M < min_m || dst->ne[2] != 1) {
+        return false;
+    }
+    if (gate->ne[0] != N || up->ne[0] != N || gate->ne[1] != M || up->ne[1] != M) {
+        return false;
+    }
+    if (dst->nb[1] != N * (int64_t) sizeof(float)) {
+        return false;
+    }
+    const int64_t gs = gate->nb[1] / (int64_t) sizeof(float);
+    const int64_t us = up->nb[1] / (int64_t) sizeof(float);
+    if (gs < N || us < N) {
         return false;
     }
     ggml_rad_act_buf b = ggml_rad_act_get(M, N, ctx.stream());
@@ -2381,7 +2419,7 @@ bool ggml_cuda_try_swiglu_quant_fused(ggml_backend_cuda_context & ctx, const ggm
     const dim3 grid(1, (unsigned) M);
     swiglu_quant_fused_kernel<<<grid, 256, 0, ctx.stream()>>>(
         (const float *) gate->data, (const float *) up->data, (float *) dst->data,
-        b.q, b.scale, b.hashes, N, M);
+        b.q, b.scale, b.hashes, N, M, gs, us);
     ggml_rad_fused_acts[dst->data] = { b.q, b.scale, N };
     return true;
 }
