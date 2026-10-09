@@ -86,6 +86,21 @@ static __device__ __forceinline__ uint2_t e2m3_unpack8(unsigned int wv, unsigned
   return uint2_t{__builtin_amdgcn_perm(bo, be, 0x05010400u),
                  __builtin_amdgcn_perm(bo, be, 0x07030602u)};
 }
+// MXFP6 checkpoint order -> the two e2m3_unpack8 inputs. Codes are packed little-endian at six
+// bits each (code j at bit 6*j), so a 24-bit half holds exactly four of them. The split is the
+// point: 6 = 4 + 2 lands on e2m3_unpack8's wv (nibble j = elem j & 0xF, two elements per byte)
+// and h2 (2-bit field j = elem j >> 4) with no cross-lane exchange, which is why MXFP6 needs no
+// repack where MXFP4's split-half nibbles do.
+static __device__ __forceinline__ void e2m3_split8(unsigned long long w, unsigned int & wv, unsigned int & h2) {
+  const unsigned int t0 = (unsigned int) (w & 0xFFFFFFu);
+  const unsigned int t1 = (unsigned int) ((w >> 24) & 0xFFFFFFu);
+  const unsigned int l0 = (t0 & 0x00000Fu) | ((t0 >>  2) & 0x0000F0u) | ((t0 >>  4) & 0x000F00u) | ((t0 >>  6) & 0x00F000u);
+  const unsigned int l1 = (t1 & 0x00000Fu) | ((t1 >>  2) & 0x0000F0u) | ((t1 >>  4) & 0x000F00u) | ((t1 >>  6) & 0x00F000u);
+  const unsigned int u0 = ((t0 >>  4) & 0x000003u) | ((t0 >>  8) & 0x00000Cu) | ((t0 >> 12) & 0x000030u) | ((t0 >> 16) & 0x0000C0u);
+  const unsigned int u1 = ((t1 >>  4) & 0x000003u) | ((t1 >>  8) & 0x00000Cu) | ((t1 >> 12) & 0x000030u) | ((t1 >> 16) & 0x0000C0u);
+  wv = l0 | (l1 << 16);
+  h2 = u0 | (u1 << 8);
+}
 
 #define BM 128
 #define BN 64
@@ -564,7 +579,8 @@ static __device__ __forceinline__ void radiance_lds_barrier() {
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
-template <int TN, bool WPERM, int LBK = BK, bool E6 = false, bool F32OUT = false, bool RADSC = false>
+template <int TN, bool WPERM, int LBK = BK, bool E6 = false, bool F32OUT = false, bool RADSC = false,
+          bool E6PACK = false>
 __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
@@ -598,7 +614,7 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
   const int ksteps_g = K / 16;
   const int Mt = (M + 15) >> 4;
 
-  if constexpr (E6) { if (tid < 28) sTab[tid] = ((const unsigned int *)kE2M3)[tid]; }
+  if constexpr (E6 || E6PACK) { if (tid < 28) sTab[tid] = ((const unsigned int *)kE2M3)[tid]; }
   else if (tid < 32) sMag[tid] = ((const unsigned int *)kMag)[tid];
   radiance_lds_barrier();
 
@@ -643,6 +659,15 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
       wrc[it] = gn < N - WSLOTS ? gn : N - WSLOTS;      // global clamped row
       wlanec[it] = (lane_ & 16) | (wrc[it] & 15);
       wkst[it] = kst;
+    } else if constexpr (E6PACK) {
+      // MXFP6 packed: one iteration is a 16-element group = 12 packed bytes, so wcol is the
+      // group's ELEMENT base in [0, LBK) rather than a 4-bit byte column. The group count
+      // BNF_T*LBK/16 equals NIT*NTHREADS, so the iteration count is unchanged.
+      const int g = it * NTHREADS + tid;
+      wrow[it] = g / (LBK / 16);
+      wcol[it] = (g % (LBK / 16)) * 16;
+      wrc[it] = wrow[it] < N - 1 - n0 ? wrow[it] : N - 1 - n0;
+      wkst[it] = 0; wlanec[it] = 0;
     } else {
       const int idx = it * NTHREADS * 8 + tid * 8;
       wrow[it] = idx / (LBK / 2); wcol[it] = idx % (LBK / 2);
@@ -695,6 +720,32 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
         const int blk = (k0 + wkst[it] * 16) / 32;
         if constexpr (WSLOTS == 4) wsv[it] = *(const unsigned int *)(Ws + (size_t)blk * N + wrc[it]);
         else                       wsv[it] = *(const unsigned short *)(Ws + (size_t)blk * N + wrc[it]);
+      }
+    } else if constexpr (E6PACK) {
+      // MXFP6 checkpoint order, no repack. One 16-element group is 12 packed bytes; the 96
+      // bits split into two 48-bit halves, each eight 6-bit codes at bit 6*j. The scale comes
+      // from the source block's own e[] tail, past the 192-byte qs region of that block.
+      // A group never straddles a block (256/16 == 16 groups per block), so one group sees
+      // exactly one sub-block scale.
+      const size_t blk_row_bytes = (size_t) (K / QK_MXFP6) * sizeof(block_mxfp6);
+      const unsigned char *__restrict__ Wb =
+          W + (size_t) __builtin_amdgcn_readfirstlane((int) ((size_t) n0 * blk_row_bytes));
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        const unsigned int ksub = (unsigned int) (k0 + wcol[it]);
+        const size_t rowoff = (size_t) wrc[it] * blk_row_bytes
+                            + (size_t) (ksub / QK_MXFP6) * sizeof(block_mxfp6);
+        const unsigned char *src = Wb + rowoff + (size_t) (ksub % QK_MXFP6) / 16 * 12;
+        // 12 bytes, 4-byte aligned (block 200 and group offset 12 are both multiples of 4).
+        const unsigned int a0 = *(const unsigned int *) (src + 0);
+        const unsigned int a1 = *(const unsigned int *) (src + 4);
+        const unsigned int a2 = *(const unsigned int *) (src + 8);
+        unsigned int wv0, h20, wv1, h21;
+        e2m3_split8((unsigned long long) a0 | ((unsigned long long) (a1 & 0xFFFFu) << 32), wv0, h20);
+        e2m3_split8((unsigned long long) (a1 >> 16) | ((unsigned long long) a2 << 16), wv1, h21);
+        pk[it] = uint4_t{wv0, wv1, 0u, 0u};
+        hp[it] = uint2_t{h20, h21};
+        wsv[it] = Wb[rowoff + (size_t) 6 * QK_MXFP6 / 8 + (size_t) (ksub % QK_MXFP6) / QK_MXFP6_SUB];
       }
     } else {
       const unsigned char *__restrict__ Wb = W + (size_t)__builtin_amdgcn_readfirstlane((int)(((size_t)n0 * K + k0) / 2));
@@ -759,6 +810,20 @@ __global__ __launch_bounds__(NTHREADS) void radiance_mxfp4_fp8_gemm_atiled(
               uint2_t{__builtin_amdgcn_perm(bo, be, 0x05010400u),
                       __builtin_amdgcn_perm(bo, be, 0x07030602u)};
         }
+    } else if constexpr (E6PACK) {
+      // MXFP6 packed: one group is 16 elements in two 8-element halves, both inside one
+      // 32-element sub-block, so a single d covers the pair. Same e2m3_unpack8 as the
+      // fragment-order E6 path, fed the split of the checkpoint's packed codes.
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        int d = (int) wref[it] - (int) wsv[it];
+        d = d < 0 ? 0 : (d > 6 ? 6 : d);
+        const uint4_t t = *(const uint4_t *) &sTab[d * 4];
+        *(uint2_t *) &sW[wrow[it] * LWSTR + wcol[it]] =
+            e2m3_unpack8(pk[it][0], hp[it][0], t[0], t[1], t[2]);
+        *(uint2_t *) &sW[wrow[it] * LWSTR + wcol[it] + 8] =
+            e2m3_unpack8(pk[it][1], hp[it][1], t[0], t[1], t[2]);
+      }
     } else {
 #pragma unroll
       for (int it = 0; it < NW; ++it) {
@@ -2038,6 +2103,38 @@ void ggml_cuda_radiance_gather_scales(const unsigned char * src_rad, int N, int 
     radiance_gather_scales_kernel<<<N, 256, 0, stream>>>(src_rad, N, nb, Ws, Wref);
 }
 
+// MXFP6 packed: the per-row reference exponent is the max over the row's block e[] tails. There
+// is no separate scale plane (each 200-byte block carries its own eight), so unlike the RAD path
+// this reads the checkpoint bytes directly. Ws is unused; the fold reads the same tails in situ.
+__global__ void radiance_gather_scales_mxfp6_kernel(const unsigned char * __restrict__ src, int N,
+                                                    int nb, unsigned char * __restrict__ Wref) {
+    const int n = blockIdx.x;               // one row per block
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const unsigned char * row = src + (size_t) n * nb * sizeof(block_mxfp6);
+    uint8_t local = 0;
+    for (int b = tid; b < nb; b += stride) {
+        const unsigned char * e = row + (size_t) b * sizeof(block_mxfp6) + 6 * QK_MXFP6 / 8;
+        for (int s = 0; s < QK_MXFP6 / QK_MXFP6_SUB; ++s) {
+            if (e[s] > local) local = e[s];
+        }
+    }
+    __shared__ uint8_t shmax[256];
+    shmax[tid] = local;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && shmax[tid + off] > shmax[tid]) shmax[tid] = shmax[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) Wref[n] = shmax[0];
+}
+
+void ggml_cuda_radiance_gather_scales_mxfp6(const unsigned char * src, int N, int K,
+                                            unsigned char * Wref, cudaStream_t stream) {
+    const int nb = (int)(K / QK_MXFP6);
+    radiance_gather_scales_mxfp6_kernel<<<N, 256, 0, stream>>>(src, N, nb, Wref);
+}
+
 void ggml_cuda_radiance_repack(const void * src_llama, int64_t s01, int N, int K,
                                void * W, void * Ws, void * Wref, cudaStream_t stream) {
     const int nb = K / 32;
@@ -2098,28 +2195,29 @@ void ggml_cuda_radiance_quantize_tokens(const float * x, int64_t sx, int64_t K, 
 }
 
 static void launch_at_f32(uintptr_t at, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
-                          uintptr_t cf, int M, int N, int K, uintptr_t stream, bool radsc) {
+                          uintptr_t cf, int M, int N, int K, uintptr_t stream, bool radsc,
+                          bool e6pack = false) {
     dim3 fblock(NTHREADS);
     if (M >= 2048 && N >= BNF_OF(4)) {
         constexpr int B_ = BNF_OF(4);
         dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);
-#define RAD_LAUNCH_AT4(RS_)         hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, 64, false, true, RS_>),                            fgrid, fblock, 0, (hipStream_t)stream,                            (const unsigned char *)at, (const unsigned char *)w,                            (const unsigned char *)ws, (const unsigned char *)wref,                            (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0,                            (const unsigned char *)nullptr, (float *)cf)
-        if (radsc) RAD_LAUNCH_AT4(true); else RAD_LAUNCH_AT4(false);
+#define RAD_LAUNCH_AT4(RS_, E6P_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, 64, false, true, RS_, E6P_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
+        if (e6pack) RAD_LAUNCH_AT4(false, true); else if (radsc) RAD_LAUNCH_AT4(true, false); else RAD_LAUNCH_AT4(false, false);
 #undef RAD_LAUNCH_AT4
     } else {
         constexpr int B_ = BNF_OF(2);
         dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);
-#define RAD_LAUNCH_AT2(RS_)         hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<2, false, 128, false, true, RS_>),                            fgrid, fblock, 0, (hipStream_t)stream,                            (const unsigned char *)at, (const unsigned char *)w,                            (const unsigned char *)ws, (const unsigned char *)wref,                            (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0,                            (const unsigned char *)nullptr, (float *)cf)
-        if (radsc) RAD_LAUNCH_AT2(true); else RAD_LAUNCH_AT2(false);
+#define RAD_LAUNCH_AT2(RS_, E6P_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<2, false, 128, false, true, RS_, E6P_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
+        if (e6pack) RAD_LAUNCH_AT2(false, true); else if (radsc) RAD_LAUNCH_AT2(true, false); else RAD_LAUNCH_AT2(false, false);
 #undef RAD_LAUNCH_AT2
     }
 }
 
 void ggml_cuda_radiance_gemm_f32(const void * a_q, const void * w, const void * ws, const void * wref,
                                  const float * as, float * c, int M, int N, int K, cudaStream_t stream,
-                                 bool radsc) {
+                                 bool radsc, bool e6pack) {
     launch_at_f32((uintptr_t) a_q, (uintptr_t) w, (uintptr_t) ws, (uintptr_t) wref,
-                  (uintptr_t) as, (uintptr_t) c, M, N, K, (uintptr_t) stream, radsc);
+                  (uintptr_t) as, (uintptr_t) c, M, N, K, (uintptr_t) stream, radsc, e6pack);
 }
 
 bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t ne01,
@@ -2130,7 +2228,12 @@ bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t 
     // Both MXFP4 types are zero-copy below this threshold: M <= 4 on the MMVQ plane vec_dot,
     // M in [5,255] on the MMQ RAD tile loader, so neither pays an unrad rebuild.
     const int64_t min_m = getenv("GGML_RAD_PREFILL_MIN_M") ? atoll(getenv("GGML_RAD_PREFILL_MIN_M")) : 256;
-    const bool type_ok = type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP4_RAD;
+    // MXFP6 (type 45) joins here under E6PACK: its packed checkpoint bytes are read in place, so
+    // it is zero-copy exactly like the two MXFP4 types and needs no new GGUF type or repack.
+    // GGML_RAD_MXFP6_DISABLE isolates the MXFP6 contribution in an A/B (GGML_RAD_DISABLE would
+    // also drop MXFP4, so the two effects could not be told apart).
+    const bool mxfp6_ok = type != GGML_TYPE_MXFP6 || getenv("GGML_RAD_MXFP6_DISABLE") == nullptr;
+    const bool type_ok = (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP4_RAD || type == GGML_TYPE_MXFP6) && mxfp6_ok;
     return amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && type_ok &&
         ne11 >= min_m && ne00 % 64 == 0 && ne10 == ne00 && (ne01 % 16 == 0) && contiguous_dst;
 }

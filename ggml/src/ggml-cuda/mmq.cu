@@ -143,7 +143,8 @@ struct ggml_radiance_weight {
     void * Ws;
     void * Wref;
     int    device;
-    bool   own_w = true; // false when W aliases the weight buffer (MXFP4_RAD)
+    bool   own_w = true;   // false when W aliases the weight buffer (MXFP4_RAD)
+    bool   e6pack = false; // MXFP6 packed: read the checkpoint bytes in place, fold to e4m3
 };
 
 static std::unordered_map<const void *, ggml_radiance_weight> g_radiance_weights;
@@ -233,7 +234,19 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
         const size_t wq_bytes  = (size_t)N * K / 2;
         const size_t ws_bytes  = (size_t)N * (K / 32);
         const size_t wref_bytes = (size_t)N;
-        if (src0->type == GGML_TYPE_MXFP4_RAD) {
+        if (src0->type == GGML_TYPE_MXFP6) {
+            // MXFP6 zero-copy: the atiled E6PACK path reads the checkpoint's packed 6-bit bytes
+            // in place and folds them to e4m3, so W aliases the weight buffer and there is no
+            // scale plane to stage (each source block carries its own e[] tail, read in situ).
+            // Wref (row max exponent, N bytes) comes from a gather over those tails.
+            w.own_w  = false;
+            w.e6pack = true;
+            w.W      = (unsigned char *) src0->data;
+            w.Ws     = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales_mxfp6((const unsigned char *) src0->data, N, K,
+                                                   (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_MXFP4_RAD) {
             w.own_w = false;   // W aliases the weight buffer (full-plane rad2 layout)
             // zero-copy: the atiled RADSC path reads the row-major scale plane straight from
             // the weight buffer (W + N*K/2), so no transposed Ws is allocated. Wref (row max
@@ -266,7 +279,7 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
 
     ggml_cuda_radiance_gemm_f32(q8, w.W, w.Ws, w.Wref, as,
                                 (float *) dst->data, (int) M, (int) N, (int) K, stream,
-                                src0->type == GGML_TYPE_MXFP4_RAD);
+                                src0->type == GGML_TYPE_MXFP4_RAD, w.e6pack);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
