@@ -2083,7 +2083,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
 
     get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
-        ne10, nb11, nb12, nb13,
+        ne10, 1, nb11, nb12, nb13,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
     CUDA_CHECK(cudaGetLastError());
@@ -2139,7 +2139,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
-        ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
+        ne0, 1, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
 }
@@ -5851,6 +5851,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q4_0_SYM4:
 // OFFLOAD-ROCM
                         return true;
+                    case GGML_TYPE_MXFP4_RAD:
+                        // dedicated kernel reads the tensor-wide code and scale planes at
+                        // 32-element granularity, so QK_K alignment is not required
+                        return op->src[0]->ne[0] % QK_MXFP4 == 0;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_MXFP4_E4M3:

@@ -69,6 +69,50 @@ static __global__ void k_get_rows_kq(
     }
 }
 
+// MXFP4_RAD keeps a tensor-wide code plane followed by a tensor-wide scale plane, so the
+// scales of a row are not adjacent to its codes. k_get_rows_kq assumes 17 B blocks inside
+// one row and cannot be reused; read both planes with their tensor-wide strides instead.
+template<typename dst_t>
+static __global__ void k_get_rows_mxfp4_rad(
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t n_rows,
+        const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_sync();
+    const int64_t nb = ne00/QK_MXFP4;
+    const uint8_t * codes  = (const uint8_t *) src0;
+    const uint8_t * scales = codes + (size_t) n_rows*nb*(QK_MXFP4/2);
+
+    const int lane   = threadIdx.x % QK_MXFP4;
+    const int sub    = threadIdx.x / QK_MXFP4;
+    const int nsub   = blockDim.x / QK_MXFP4;
+    // element lane -> byte and nibble inside the interleaved code block:
+    // byte m (m < 8): lo = elem 2m, hi = elem 2m+1; byte 8+m: lo = elem 16+2m, hi = elem 16+2m+1
+    const int cbyte  = lane < 16 ? lane/2 : QK_MXFP4/4 + (lane - 16)/2;
+    const int cshift = (lane % 2) ? 4 : 0;
+
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        const int i10 = blockIdx.x;
+        const uint2 dm  = fast_div_modulo((uint32_t)z, ne12_fdv);
+        const int i11 = dm.x;
+        const int i12 = dm.y;
+
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
+        const uint8_t * c_row = codes  + (size_t) i01*nb*(QK_MXFP4/2);
+        const uint8_t * s_row = scales + (size_t) i01*nb;
+
+        for (int64_t ib = (int64_t) blockIdx.y*nsub + sub; ib < nb; ib += (int64_t) gridDim.y*nsub) {
+            const uint8_t q = c_row[ib*(QK_MXFP4/2) + cbyte];
+            const float   d = ggml_cuda_e8m0_to_fp32(s_row[ib]);
+            dst_row[ib*QK_MXFP4 + lane] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[(q >> cshift) & 0x0F]*0.5f);
+        }
+    }
+}
+
 template<typename src0_t, typename dst_t>
 static __global__ void k_get_rows_float(
         const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
@@ -230,6 +274,42 @@ static void get_rows_cuda_kq(
         s10, s11, s12/*, s13*/);
 }
 
+template<typename dst_t>
+static void get_rows_cuda_mxfp4_rad(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const int64_t n_rows,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_MXFP4 == 0);
+    const int64_t nb   = ne00/QK_MXFP4;
+    const int     nsub = CUDA_GET_ROWS_BLOCK_SIZE/QK_MXFP4;
+    const int64_t nb_y = (nb + nsub - 1)/nsub;
+
+    const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+    const dim3 block_nums(ne10, MIN(nb_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+
+    // strides in elements
+    const size_t s1 = nb1 / sizeof(dst_t);
+    const size_t s2 = nb2 / sizeof(dst_t);
+    const size_t s3 = nb3 / sizeof(dst_t);
+
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    GGML_ASSERT(ne12 > 0);
+    GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
+    const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    k_get_rows_mxfp4_rad<dst_t><<<block_nums, block_dims, 0, stream>>>(
+        src0_d, src1_d, dst_d,
+        ne00, n_rows,
+        ne11, ne12_fdv,
+        s1, s2, s3,
+        s10, s11, s12);
+}
+
 template<typename src0_t, typename dst_t>
 static void get_rows_cuda_float(
         const src0_t * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -294,8 +374,8 @@ static void get_rows_cuda_float(
 
 template <typename dst_t>
 static void ggml_cuda_get_rows_switch_src0_type(
-        const void * src0_d, const ggml_type src0_type, const int32_t * src1_d, dst_t * dst_d,
-        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const void * src0_d, ggml_type src0_type, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const int64_t n_rows, const size_t nb01, const size_t nb02, const size_t nb03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
         cudaStream_t stream) {
@@ -438,6 +518,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_MXFP4_RAD:
+            get_rows_cuda_mxfp4_rad<dst_t>(src0_d, src1_d, dst_d,
+                ne00, n_rows, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         case GGML_TYPE_MXFP4_E4M3:
             get_rows_cuda_kq<32, dst_t, dequantize_mxfp4_e4m3<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
@@ -450,26 +534,26 @@ static void ggml_cuda_get_rows_switch_src0_type(
 
 void get_rows_cuda(
         const void * src0_d, ggml_type src0_type, const int32_t * src1_d, void * dst_d, ggml_type dst_type,
-        int64_t ne00, size_t nb01, size_t nb02, size_t nb03,
+        int64_t ne00, int64_t n_rows, size_t nb01, size_t nb02, size_t nb03,
         int64_t ne10, int64_t ne11, int64_t ne12, size_t nb10, size_t nb11, size_t nb12,
         size_t nb1, size_t nb2, size_t nb3,
         cudaStream_t stream) {
     switch (dst_type) {
         case GGML_TYPE_F32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (float *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, n_rows, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_I32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (int32_t *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, n_rows, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_F16:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (half *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, n_rows, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_BF16:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (nv_bfloat16 *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, n_rows, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         default:
             GGML_ABORT("%s: unsupported dst type: %s\n", __func__, ggml_type_name(dst_type));
@@ -492,8 +576,10 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
 
+    const int64_t n_rows = ne01*ne02*ne03;
+
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
-        ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+        ne00, n_rows, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
 }
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
