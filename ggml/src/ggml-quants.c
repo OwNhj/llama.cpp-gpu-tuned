@@ -6743,6 +6743,29 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
     return true;
 }
 
+// One row of a real MXFP4_RAD tensor. The on-file layout is tensor-wide: a contiguous
+// [nrows, nb*16] interleaved code plane followed by a [nrows, nb] e8m0 scale plane, so a
+// row pointer alone cannot reach its scales. dequantize_row_mxfp4_rad below assumes the
+// per-row layout and is only correct for a single-row tensor.
+void dequantize_row_mxfp4_rad_row(const void * GGML_RESTRICT base, int64_t nrows,
+                                  int64_t i01, int64_t nb, float * GGML_RESTRICT y) {
+    static const int qk = QK_MXFP4;
+    const uint8_t * codes  = (const uint8_t *) base + (size_t) i01*nb*(qk/2);
+    const uint8_t * scales = (const uint8_t *) base + (size_t) nrows*nb*(qk/2) + (size_t) i01*nb;
+
+    for (int64_t b = 0; b < nb; b++) {
+        const float d = GGML_E8M0_TO_FP32_HALF(scales[b]);
+        const uint8_t * q = codes + b*(qk/2);
+        // radi byte m (m<8): lo=elem 2m, hi=elem 2m+1; radi byte 8+m: lo=elem 16+2m, hi=elem 16+2m+1
+        for (int m = 0; m < 8; ++m) {
+            y[b*qk + 2*m + 0]      = kvalues_mxfp4[q[m] & 0x0F]*d;
+            y[b*qk + 2*m + 1]      = kvalues_mxfp4[q[m] >> 4]*d;
+            y[b*qk + 16 + 2*m + 0] = kvalues_mxfp4[q[8+m] & 0x0F]*d;
+            y[b*qk + 16 + 2*m + 1] = kvalues_mxfp4[q[8+m] >> 4]*d;
+        }
+    }
+}
+
 // MXFP4 radiance plane layout dequant (CPU ref path; the fast path is the CUDA GEMM).
 // buffer for one tensor-row of K elems: nb*16 interleaved code bytes + nb e8m0 scales.
 void dequantize_row_mxfp4_rad(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {

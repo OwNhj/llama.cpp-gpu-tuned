@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -5398,6 +5399,45 @@ static void ggml_compute_forward_get_rows_f32(
     }
 }
 
+
+static void ggml_compute_forward_get_rows_mxfp4_rad(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int64_t nc = ne00;
+    const int64_t nr = ggml_nelements(src1);
+    const int64_t nb = ne00/QK_MXFP4;
+    const int64_t nrows = ne01*ne02*ne03;
+
+    assert(ne0  == nc);
+    assert(nb00 == ggml_type_size(src0->type));
+    assert(ggml_nrows(dst) == nr);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int dr = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        dequantize_row_mxfp4_rad_row(src0->data, nrows, i01, nb,
+                (float *) ((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3));
+    }
+}
+
 void ggml_compute_forward_get_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -5405,6 +5445,10 @@ void ggml_compute_forward_get_rows(
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {
+        case GGML_TYPE_MXFP4_RAD:
+            {
+                ggml_compute_forward_get_rows_mxfp4_rad(params, dst);
+            } break;
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
@@ -5414,7 +5458,6 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
-        case GGML_TYPE_MXFP4_RAD:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_MXFP8:
         case GGML_TYPE_MXFP6:

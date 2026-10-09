@@ -68,6 +68,8 @@ GGML_API void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * 
 GGML_API void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_mxfp6(const block_mxfp6 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_mxfp4_rad(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+GGML_API void dequantize_row_mxfp4_rad_row(const void * GGML_RESTRICT base, int64_t nrows,
+                                           int64_t i01, int64_t nb, float * GGML_RESTRICT y);
 GGML_API void dequantize_row_mxfp4_e4m3(const block_mxfp4_e4m3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_f8(const block_f8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
