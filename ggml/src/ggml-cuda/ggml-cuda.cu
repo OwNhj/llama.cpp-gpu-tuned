@@ -2829,6 +2829,49 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
+// Residual add, post-attention RMS norm and the norm weight multiply. The residual is read
+// again by the FFN output add, so it must be written out (see ggml_cuda_op_add_rms_norm_fused).
+static bool ggml_cuda_should_fuse_add_rms_norm(const ggml_tensor * add,
+                                               const ggml_tensor * rms_norm,
+                                               const ggml_tensor * mul) {
+    if (add->op != GGML_OP_ADD || rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) {
+        return false;
+    }
+
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    if (!a || !b || rms_norm->src[0] != add) {
+        return false;
+    }
+
+    if (mul->src[0] != rms_norm && mul->src[1] != rms_norm) {
+        return false;
+    }
+    const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+        rms_norm->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (!ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, add) ||
+        !ggml_are_same_shape(add, rms_norm) || !ggml_are_same_shape(rms_norm, mul)) {
+        return false;
+    }
+
+    // the fused kernel indexes rows densely, so every operand must be contiguous
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(add) ||
+        !ggml_is_contiguous(rms_norm) || !ggml_is_contiguous(weight) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+
+    if (weight->ne[0] != add->ne[0] || ggml_nrows(weight) != 1) {
+        return false;
+    }
+
+    return ggml_get_op_params_f32(rms_norm, 0) >= 0.0f;
+}
+
 // A Hadamard rotation of an activation ([MUL signs, RESHAPE,] MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD)
 // whose every use is a PTQ1_0 mat-vec on the mmvq path does not need to exist in F32: each of those
 // mat-vecs quantizes it to q8_1 straight away, so the transform kernel quantizes as it goes and writes
@@ -3446,6 +3489,22 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         if (ggml_cuda_should_fuse_rope_set_rows(rope, view, set_rows)) {
             int out_nodes[] = { node_idx + 2 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+        }
+    }
+
+    // The residual is added to the FFN output again, so ADD stays in the graph as an output.
+    std::initializer_list<enum ggml_op> add_rms_norm_ops = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+
+    if (is_equal(add_rms_norm_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx, node_idx + 2 })) {
+        const ggml_tensor * add      = cgraph->nodes[node_idx];
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 2];
+
+        if (ggml_cuda_should_fuse_add_rms_norm(add, rms_norm, mul)) {
+            // No memory range check: the kernel handles each element in one thread and
+            // synchronizes between the two passes, so it tolerates the in-place aliasing
+            // the graph allocator applies here. Same as the RMS_NORM/MUL/ADD path below.
+            return true;
         }
     }
 
@@ -4508,6 +4567,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        static const bool add_rms_norm_fusion = [] {
+            const char * env = getenv("GGML_CUDA_ADD_RMS_NORM_FUSION");
+            return !env || std::atoi(env) != 0;
+        }();
+        if (add_rms_norm_fusion) {
+            ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+            return 2;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
