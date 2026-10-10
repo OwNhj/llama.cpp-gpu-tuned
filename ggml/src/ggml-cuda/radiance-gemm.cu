@@ -819,6 +819,18 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
       wcol[it] = (g % (LBK / 16)) * 16;
       wrc[it] = wrow[it] < N - 1 - n0 ? wrow[it] : N - 1 - n0;
       wkst[it] = 0; wlanec[it] = 0;
+    } else if constexpr (PTQ1) {
+      // PTQ1_0 decodes one 16-element group per slot, and the group picks which of the
+      // block's byte ranges the decode reads. Letting the packed byte column vary with the
+      // lane put all eight groups in one warp, so the three decode ranges ran one after
+      // another with a fraction of the lanes active. Give the group to the slot index
+      // instead: a 64-thread run then shares one group, so no warp diverges. The slot
+      // order is unchanged, only which thread handles which slot.
+      const int slot = it * NTHREADS_T + tid;
+      wrow[it] = slot % BNF_T;
+      wcol[it] = (slot / BNF_T) * 8;
+      wrc[it] = wrow[it] < N - 1 - n0 ? wrow[it] : N - 1 - n0;
+      wkst[it] = 0; wlanec[it] = 0;
     } else {
       const int idx = it * NTHREADS_T * 8 + tid * 8;
       wrow[it] = idx / (LBK / 2); wcol[it] = idx % (LBK / 2);
