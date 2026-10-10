@@ -580,73 +580,23 @@ static __device__ __forceinline__ void radiance_lds_barrier() {
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
-// ---- PTQ1_0 (type 143) staging helpers ----
-//
-// A 28-byte block holds 128 trits in base-3 packing plus one fp16 scale:
-//   qs[0..15]  5 trits/byte -> elements 0..79   (one trit index per 16 elements)
-//   qs[16..23] 5 trits/byte -> elements 80..119 (one trit index per 8 elements)
-//   qh[0..1]   4 trits/byte -> elements 120..127 (one trit index per 2 elements)
-//   d (fp16) at offset 26
-// Element order matches dequantize_row_ptq1_0 in ggml-quants.c. The value is
-// trit * d with trit in {-1,0,+1}.
-//
-// Decode the 16 trits starting at `base` (a multiple of 16) into four dwords of
-// four sign-extended int8 each (0xFF / 0x00 / 0x01).
-static __device__ __forceinline__ void ptq1_0_decode16(const unsigned char * __restrict__ blk,
-                                                       int base, unsigned int trit[4]) {
-    constexpr unsigned int kP3[5] = {1u, 3u, 9u, 27u, 81u};
-    const unsigned int * qs = (const unsigned int *) blk;   // 24 B, 4-byte aligned
-    const unsigned char * qh = blk + 24;
-    if (base < 80) {
-        const unsigned int pw = kP3[base >> 4];
-        trit[0] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[0], pw);
-        trit[1] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[1], pw);
-        trit[2] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[2], pw);
-        trit[3] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[3], pw);
-    } else if (base < 112) {
-        // two 8-element groups: trit index n then n+1
-        const unsigned int pw = kP3[(base - 80) >> 3];
-        trit[0] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[4], pw);
-        trit[1] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[5], pw);
-        trit[2] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[4], pw * 3u);
-        trit[3] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[5], pw * 3u);
-    } else {
-        // base == 112: elements 112..119 come from qs, 120..127 from qh
-        const unsigned int pw = kP3[4];
-        trit[0] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[4], pw);
-        trit[1] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[5], pw);
-        // elements 120..127: the byte alternates qh[0]/qh[1], trit index (e-120)>>1
-        unsigned int lo = 0, hi = 0;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const unsigned int a = (unsigned int) ptq1_0_trit_pow3(qh[0], kP3[j]) & 0xFFu;
-            const unsigned int b = (unsigned int) ptq1_0_trit_pow3(qh[1], kP3[j]) & 0xFFu;
-            if (j < 2) {
-                lo |= a << (8 * (2 * j));
-                lo |= b << (8 * (2 * j + 1));
-            } else {
-                hi |= a << (8 * (2 * (j - 2)));
-                hi |= b << (8 * (2 * (j - 2) + 1));
-            }
-        }
-        trit[2] = lo;
-        trit[3] = hi;
-    }
-}
-
 // Four base-3 packed bytes -> four int8 weights in one pass. The xi digits are kept in
 // {0,1,2} instead of being turned into {0,1,-1} bytes first, so a single v_perm table
 // {0x100-M, 0, +M} indexed by xi gives {+M, 0, -M} for all four lanes at once. The probe
 // covers 65536 dwords x 5 powers x 52 magnitudes, bit-identical to the two-step version.
 static __device__ __forceinline__ unsigned int ptq1_0_decode4_i8(unsigned int u, unsigned int p3,
-                                                                unsigned int M) {
+                                                                unsigned int tab) {
     const int P0 = __byte_perm((int) u, 0, 0x4140);
     const int P1 = __byte_perm((int) u, 0, 0x4342);
     const int X0 = ((P0 * (int) p3) & 0x00FF00FF) * 3;
     const int X1 = ((P1 * (int) p3) & 0x00FF00FF) * 3;
     const unsigned int xi = __builtin_amdgcn_perm((unsigned) (X1 >> 8), (unsigned) (X0 >> 8), 0x06040200u);
-    const unsigned int tab = ((0x100u - M) & 0xFFu) | ((M & 0xFFu) << 16);
     return __builtin_amdgcn_perm(0u, tab, xi & 0x03030303u);
+}
+
+// v_perm table for one magnitude: byte0 = -M, byte1 = 0, byte2 = +M.
+static __device__ __forceinline__ unsigned int ptq1_0_i8_tab(unsigned int M) {
+    return ((0x100u - M) & 0xFFu) | ((M & 0xFFu) << 16);
 }
 
 // Same decode as ptq1_0_decode16, but fed from seven dwords the caller has already
@@ -661,21 +611,21 @@ static __device__ __forceinline__ void ptq1_0_decode16_words(const unsigned int 
                                                              unsigned int M, unsigned int trit[4]) {
     constexpr unsigned int kP3[5] = {1u, 3u, 9u, 27u, 81u};
     if (base < 80) {
-        const unsigned int pw = kP3[base >> 4];
-        trit[0] = ptq1_0_decode4_i8(q0, pw, M);
-        trit[1] = ptq1_0_decode4_i8(q1, pw, M);
-        trit[2] = ptq1_0_decode4_i8(q2, pw, M);
-        trit[3] = ptq1_0_decode4_i8(q3, pw, M);
+        const unsigned int pw = kP3[base >> 4], tab = ptq1_0_i8_tab(M);
+        trit[0] = ptq1_0_decode4_i8(q0, pw, tab);
+        trit[1] = ptq1_0_decode4_i8(q1, pw, tab);
+        trit[2] = ptq1_0_decode4_i8(q2, pw, tab);
+        trit[3] = ptq1_0_decode4_i8(q3, pw, tab);
     } else if (base < 112) {
-        const unsigned int pw = kP3[(base - 80) >> 3];
-        trit[0] = ptq1_0_decode4_i8(q4, pw, M);
-        trit[1] = ptq1_0_decode4_i8(q5, pw, M);
-        trit[2] = ptq1_0_decode4_i8(q4, pw * 3u, M);
-        trit[3] = ptq1_0_decode4_i8(q5, pw * 3u, M);
+        const unsigned int pw = kP3[(base - 80) >> 3], tab = ptq1_0_i8_tab(M);
+        trit[0] = ptq1_0_decode4_i8(q4, pw, tab);
+        trit[1] = ptq1_0_decode4_i8(q5, pw, tab);
+        trit[2] = ptq1_0_decode4_i8(q4, pw * 3u, tab);
+        trit[3] = ptq1_0_decode4_i8(q5, pw * 3u, tab);
     } else {
-        const unsigned int pw = kP3[4];
-        trit[0] = ptq1_0_decode4_i8(q4, pw, M);
-        trit[1] = ptq1_0_decode4_i8(q5, pw, M);
+        const unsigned int pw = kP3[4], tab = ptq1_0_i8_tab(M);
+        trit[0] = ptq1_0_decode4_i8(q4, pw, tab);
+        trit[1] = ptq1_0_decode4_i8(q5, pw, tab);
         // elements 120..127: the byte alternates qh[0]/qh[1], trit index (e-120)>>1.
         // Pack the four xi of each qh byte into one dword, then table-map it.
         unsigned int lo = 0, hi = 0;
@@ -691,7 +641,51 @@ static __device__ __forceinline__ void ptq1_0_decode16_words(const unsigned int 
                 hi |= ((b + 1u) & 3u) << (8 * (2 * (j - 2) + 1));
             }
         }
-        const unsigned int tab = ((0x100u - M) & 0xFFu) | ((M & 0xFFu) << 16);
+        trit[2] = __builtin_amdgcn_perm(0u, tab, lo & 0x03030303u);
+        trit[3] = __builtin_amdgcn_perm(0u, tab, hi & 0x03030303u);
+    }
+}
+
+// Pointer-fed decode that loads only the words its range needs. Elements 0..79 come from
+// qs dwords 0..3 (every 16-element group reads the same four, only the base-3 power
+// changes), 80..119 from dwords 4 and 5, and 112..127 additionally from qh. Reading all
+// seven up front costs three to five unused global loads per slot.
+static __device__ __forceinline__ void ptq1_0_decode16_lazy(const unsigned int * __restrict__ qs,
+                                                            int base, unsigned int M,
+                                                            unsigned int trit[4]) {
+    constexpr unsigned int kP3[5] = {1u, 3u, 9u, 27u, 81u};
+    if (base < 80) {
+        const unsigned int pw = kP3[base >> 4], tab = ptq1_0_i8_tab(M);
+        trit[0] = ptq1_0_decode4_i8(qs[0], pw, tab);
+        trit[1] = ptq1_0_decode4_i8(qs[1], pw, tab);
+        trit[2] = ptq1_0_decode4_i8(qs[2], pw, tab);
+        trit[3] = ptq1_0_decode4_i8(qs[3], pw, tab);
+    } else if (base < 112) {
+        const unsigned int pw = kP3[(base - 80) >> 3], tab = ptq1_0_i8_tab(M);
+        const unsigned int a = qs[4], b = qs[5];
+        trit[0] = ptq1_0_decode4_i8(a, pw, tab);
+        trit[1] = ptq1_0_decode4_i8(b, pw, tab);
+        trit[2] = ptq1_0_decode4_i8(a, pw * 3u, tab);
+        trit[3] = ptq1_0_decode4_i8(b, pw * 3u, tab);
+    } else {
+        const unsigned int pw = kP3[4], tab = ptq1_0_i8_tab(M);
+        trit[0] = ptq1_0_decode4_i8(qs[4], pw, tab);
+        trit[1] = ptq1_0_decode4_i8(qs[5], pw, tab);
+        // elements 120..127: the byte alternates qh[0]/qh[1], trit index (e-120)>>1
+        const unsigned int qh = qs[6] & 0xFFFFu;   // bytes 24..25
+        unsigned int lo = 0, hi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned int a = (unsigned int) ptq1_0_trit_pow3(qh & 0xFFu, kP3[j]) & 0xFFu;
+            const unsigned int b = (unsigned int) ptq1_0_trit_pow3((qh >> 8) & 0xFFu, kP3[j]) & 0xFFu;
+            if (j < 2) {
+                lo |= ((a + 1u) & 3u) << (8 * (2 * j));
+                lo |= ((b + 1u) & 3u) << (8 * (2 * j + 1));
+            } else {
+                hi |= ((a + 1u) & 3u) << (8 * (2 * (j - 2)));
+                hi |= ((b + 1u) & 3u) << (8 * (2 * (j - 2) + 1));
+            }
+        }
         trit[2] = __builtin_amdgcn_perm(0u, tab, lo & 0x03030303u);
         trit[3] = __builtin_amdgcn_perm(0u, tab, hi & 0x03030303u);
     }
@@ -837,9 +831,7 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
 #pragma unroll
   for (int it = 0; it < NW; ++it) {
     if constexpr (PTQ1) {
-      const unsigned int h = *(const unsigned short *) (Wref + 2 * (n0 + wrc[it]));
-      const float drow = ptq1_h2f(h);
-      wref[it] = __float_as_uint(drow > 0.0f ? 127.0f / drow : 0.0f);
+      // M comes from sM8, built once per tile row; nothing per-slot is needed.
     } else if constexpr (WPERM) {
       if constexpr (WSLOTS == 4) wref[it] = *(const unsigned int *)(Wref + wrc[it]);
       else                       wref[it] = *(const unsigned short *)(Wref + wrc[it]);
@@ -942,16 +934,11 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
       for (int it = 0; it < NW; ++it) {
         const unsigned int * __restrict__ bw =
             (const unsigned int *) (W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * 28);
-        // All seven words first: they are independent, so the warp issues them together
-        // instead of discovering them one at a time behind the decode branches.
-        const unsigned int q0 = bw[0], q1 = bw[1], q2 = bw[2], q3 = bw[3];
-        const unsigned int q4 = bw[4], q5 = bw[5];
-        const unsigned int qh = bw[6] & 0xFFFFu;   // bytes 24..25
         const unsigned int M = sM8[wrc[it]];
         unsigned int tr[4];
         // wcol[it] is a PACKED BYTE column in [0, LBK/2): byte column c covers elements
         // 2c and 2c+1, so the 16-element group a slot writes starts at (wcol*2) & ~15.
-        ptq1_0_decode16_words(q0, q1, q2, q3, q4, q5, qh, (wcol[it] * 2) & ~15, M, tr);
+        ptq1_0_decode16_lazy(bw, (wcol[it] * 2) & ~15, M, tr);
         *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = uint4_t{tr[0], tr[1], tr[2], tr[3]};
       }
     } else {
