@@ -3111,6 +3111,176 @@ static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgr
     return consumed;
 }
 
+// Hadamard rotation whose every consumer is a PTQ1_0 matmul on the radiance prefill path. Those read
+// int8 activations, so the rotation can quantize as it goes and its consumers then skip their own
+// quantizer: the f32 rotated row never reaches memory. RDNA4-only, and reachable only through a
+// PTQ1_0 weight, so nothing outside that path changes. Returns the node count consumed, or 0.
+// GGML_RAD_FWHT_OFF=1 disables it.
+//
+// The int8 codes overwrite the rotation's own f32 buffer, so this must not fuse unless every reader
+// is certain to take the radiance GEMM: a reader that fell back to MMQ or cuBLAS would read the codes
+// as f32. The weight cache is the one such fallback that can appear late (a capture-time repack miss),
+// so the weights are required to be resident; the scratch is reserved first so that the uncaptured
+// graph warmup is what allocates it.
+static int ggml_cuda_try_fwht_quant_i8(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph,
+                                       int node_idx) {
+    static const bool disabled = getenv("GGML_RAD_FWHT_OFF") != nullptr;
+    if (disabled || getenv("GGML_RAD_DISABLE")) {
+        return 0;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc) || !amd_wmma_available(cc)) {
+        return 0;
+    }
+
+    const ggml_tensor * x     = nullptr;
+    const ggml_tensor * signs = nullptr;
+    ggml_tensor *       mm    = nullptr;
+    int consumed = 0;
+    int i_mm     = -1;
+
+    if (ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { node_idx + 2 })) {
+        const ggml_tensor * mul     = cgraph->nodes[node_idx];
+        const ggml_tensor * reshape = cgraph->nodes[node_idx + 1];
+        mm    = cgraph->nodes[node_idx + 2];
+        x     = mul->src[0];
+        signs = mul->src[1];
+        const bool pattern_ok = ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+            mm->src[1] == reshape && reshape->src[0] == mul &&
+            signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+            signs->type == GGML_TYPE_F32 && mul->type == x->type &&
+            ggml_is_contiguous(x) && ggml_is_contiguous(signs) &&
+            signs->ne[0] == x->ne[0] && signs->ne[0] % mm->src[0]->ne[0] == 0;
+        if (!pattern_ok) {
+            return 0;
+        }
+        consumed = 3;
+        i_mm     = node_idx + 2;
+    } else {
+        mm = cgraph->nodes[node_idx];
+        if (mm->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+            return 0;
+        }
+        x = mm->src[1];
+        if (!ggml_is_contiguous(x) || !ggml_are_same_shape(x, mm)) {
+            return 0;
+        }
+        consumed = 1;
+        i_mm     = node_idx;
+    }
+
+    const int n = (int) mm->src[0]->ne[0];
+    if (n != FWHT_I8_N || (x->type != GGML_TYPE_F32 && x->type != GGML_TYPE_F16) ||
+            mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) ||
+            (mm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_nelements(mm) != ggml_nelements(x)) {
+        return 0;
+    }
+
+    // The codes reuse the transform's own f32 buffer, so nothing may alias it.
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data;
+        const char * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    if (overlaps(x, mm) || (signs && overlaps(signs, mm))) {
+        return 0;
+    }
+
+    // Every use of the rotated activation (directly or through a reshape view of the whole tensor)
+    // must be src1 of a PTQ1_0 MUL_MAT that dispatches to radiance and reads int8. Any other reader,
+    // or a consumer that could fall back to MMQ/cuBLAS and read the buffer as f32, keeps the split.
+    const ggml_tensor * aliases[8] = { mm };
+    int     n_aliases     = 1;
+    int     uses_expected = ggml_node_get_use_count(cgraph, i_mm);
+    int     uses_found    = 0;
+    bool    weights_ready = true;
+    const ggml_tensor * consumers[8] = { nullptr };   // the matmuls that read the codes
+    int     n_consumers   = 0;
+    int64_t K             = 0;
+    int64_t M             = 0;
+    for (int j = i_mm + 1; j < cgraph->n_nodes; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = t->src[s];
+            if (!src) {
+                continue;
+            }
+            bool is_alias = false;
+            for (int a = 0; a < n_aliases; ++a) {
+                if (src == aliases[a]) {
+                    is_alias = true;
+                    break;
+                }
+            }
+            if (!is_alias) {
+                continue;
+            }
+            uses_found++;
+            if (t->op == GGML_OP_RESHAPE && t->view_src == mm && t->data == mm->data &&
+                    ggml_nelements(t) == ggml_nelements(mm) && ggml_is_contiguous(t)) {
+                if (n_aliases == 8) {
+                    return 0;
+                }
+                aliases[n_aliases++] = t;
+                uses_expected += ggml_node_get_use_count(cgraph, j);
+                continue;
+            }
+            if (t->op != GGML_OP_MUL_MAT || s != 1 || !t->src[0] || t->src[0]->type != GGML_TYPE_PTQ1_0) {
+                return 0;
+            }
+            const ggml_tensor * w  = t->src[0];
+            const ggml_tensor * ac = t->src[1];
+            const int64_t Ki = w->ne[0], Ni = w->ne[1], Mi = ac->ne[1];
+            if (t->type != GGML_TYPE_F32 || ac->type != GGML_TYPE_F32 || !ggml_is_contiguous(ac) ||
+                    !ggml_is_contiguous(t) || ac->ne[0] != Ki || ac->ne[2] != 1 || ac->ne[3] != 1 ||
+                    w->ne[2] != 1 || w->ne[3] != 1 ||
+                    Ki % n != 0 || !ggml_cuda_radiance_supported(cc, GGML_TYPE_PTQ1_0, Ki, Ni, Mi, Ki, true)) {
+                return 0;
+            }
+            // ggml_cuda_mul_mat must route this matmul to the radiance GEMM. MMVQ would own it at a
+            // small batch, and MMQ only reaches radiance when it is selected at all: GGML_CUDA_FORCE_CUBLAS
+            // turns it off, and ggml_cuda_mul_mat sends the huge-vocab PTQ1_0 matmul to cuBLAS.
+            if (ggml_cuda_should_use_mmvq(w->type, cc, Mi, Ni) ||
+                    !ggml_cuda_should_use_mmq(w->type, cc, Mi, 0) || Ni > 100000) {
+                return 0;
+            }
+            if (K != 0 && (Ki != K || Mi != M)) {
+                return 0;
+            }
+            if (n_consumers == 8) {
+                return 0;
+            }
+            consumers[n_consumers++] = t;
+            K = Ki;
+            M = Mi;
+            weights_ready = weights_ready && ggml_cuda_radiance_weight_ready(w->data);
+        }
+    }
+    if (uses_found == 0 || uses_found != uses_expected || K == 0 ||
+            (int64_t) ((M + 15) & ~(int64_t) 15) * K > ggml_nbytes(mm)) {
+        return 0;
+    }
+
+    // The graph warmup executes uncaptured, so this is where the scratch gets allocated. Reserving
+    // even when the weights are not resident yet keeps that allocation off the capture path.
+    if (!ggml_cuda_radiance_fwht_i8_reserve(M, K, ctx.stream()) || !weights_ready) {
+        return 0;
+    }
+
+    float * scale = ggml_cuda_radiance_fwht_quant_i8(x->data, x->type == GGML_TYPE_F32,
+                                                     signs ? (const float *) signs->data : nullptr,
+                                                     (int) (K / n), mm->data, K, M, ctx.stream());
+    if (scale == nullptr) {
+        return 0;
+    }
+    for (int c = 0; c < n_consumers; ++c) {
+        ggml_rad_fwht_i8_act_register(consumers[c]->data, (signed char *) mm->data, scale, K, M);
+    }
+    return consumed;
+}
+
 // GET_ROWS and let the kernel index the cache row directly. Single-sequence only: with several
 // sequences a gathered row may alias a row another sequence writes in the same op.
 // GGML_CUDA_GDN_GATHER_FUSION=0 disables it. The registration lives in the evaluating context
@@ -4884,6 +5054,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                // Same for the PTQ1_0 prefill path: the rotation emits int8 and the radiance GEMMs
+                // that read it skip their own quantizer.
+                if ((node->op == GGML_OP_MUL || node->op == GGML_OP_MUL_MAT) && !is_concurrent_event_active) {
+                    const int consumed = ggml_cuda_try_fwht_quant_i8(*cuda_ctx, cgraph, i);
+                    if (consumed > 0) {
+                        i += consumed - 1;
+                        continue;
+                    }
+                }
+
                 // The normalized pre-attention residual is consumed only by a
                 // group of low-bit projections. Preserve residual + one scale per
                 // row and let their shared Q8 quantizer apply the norm weight.
@@ -5090,6 +5270,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_rad_fused_acts_reset();
+    ggml_rad_fwht_i8_acts_reset();
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);

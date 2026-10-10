@@ -42,6 +42,24 @@ bool ggml_cuda_radiance_add_rms_norm_quant(const float * a, const float * b, con
                                            float * residual, float * norm, const void * act_key,
                                            int64_t ncols, int64_t nrows, float eps,
                                            cudaStream_t stream);
+// transform width the fused PTQ1_0 Hadamard + int8 quantizer is instantiated for
+#define FWHT_I8_N 1024
+
+// fused Hadamard transform + int8 activation quantize for the PTQ1_0 prefill path. Writes the
+// int8 codes over the transform's own f32 buffer and returns the row scales; null keeps the split.
+float * ggml_cuda_radiance_fwht_quant_i8(const void * x, bool x_f32, const float * signs, int n_blk,
+                                         void * q, int64_t K, int64_t M, cudaStream_t stream);
+bool ggml_cuda_radiance_fwht_i8_reserve(int64_t M, int64_t K, cudaStream_t stream);
+// keyed by the consuming matmul's output tensor; a hit is erased, so each consumer is served once
+bool ggml_rad_fwht_i8_act_lookup(const void * consumer, int64_t K, int64_t M,
+                                 signed char ** q, float ** scale);
+void ggml_rad_fwht_i8_act_register(const void * consumer, signed char * q, float * scale,
+                                   int64_t K, int64_t M);
+void ggml_rad_fwht_i8_acts_reset(void);
+
+// true when the radiance weight caches already hold this weight on the current device.
+bool ggml_cuda_radiance_weight_ready(const void * w);
+
 bool ggml_rad_fused_act_lookup(const void * act, int64_t K,
                                const unsigned char ** q, const float ** scale);
 void ggml_rad_fused_acts_reset(void);

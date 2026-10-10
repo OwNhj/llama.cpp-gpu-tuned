@@ -1,5 +1,7 @@
 #include "common.cuh"
+#include "fwht.cuh"
 #include <hip/hip_runtime.h>
+#include <cmath>
 #include <map>
 #include <hip/hip_bf16.h>
 #include <cstdint>
@@ -2599,6 +2601,235 @@ void ggml_cuda_radiance_quantize_tokens_i8(const float * x, int64_t sx, int64_t 
     }
     *q = (signed char *) b.q;
     *scale = b.scale;
+}
+
+// ============ fused Hadamard transform + int8 activation quantize (PTQ1_0) ============
+//
+// A Hadamard rotation and the int8 quantizer that consumes it are two bandwidth-bound passes with a
+// 4-byte-per-element intermediate between them: the transform writes the rotated row as f32 and the
+// quantizer reads it straight back. On a PTQ1_0 checkpoint that round trip is the largest single
+// block of prefill traffic, and the rotated row has no other consumer.
+//
+// The two kernels below repeat the (compute-only) butterfly and never materialise the f32 row. They
+// are bit-identical to the unfused pair: same butterfly template, same fmaxf row maximum (exact and
+// order-independent), same amax/127 -> 1/d -> rint expression, same fragment-tiled store.
+#define FWHT_I8_N 1024
+
+// fwht.cu's loader is file-local; keep a copy instead of widening that header.
+template <typename T>
+static __device__ __forceinline__ float fwht_i8_load(const T value) {
+    return value;
+}
+template <>
+__device__ __forceinline__ float fwht_i8_load<half>(const half value) {
+    return __half2float(value);
+}
+
+// One block per (row, transform block). Publishes that block's largest magnitude.
+template <int NT, typename T, bool has_signs>
+__global__ __launch_bounds__(NT, 1) void fwht_i8_blkmax_kernel(
+        const T * __restrict__ src, const float * __restrict__ signs, float * __restrict__ blk_max,
+        const int64_t n_rows, const float scale, const int n_blk) {
+    constexpr int NE = FWHT_I8_N / NT;
+    __shared__ float s[FWHT_I8_N];
+    __shared__ float red[NT / 32];
+
+    const int64_t r = blockIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+    const int     tid = threadIdx.x;
+    const int     blk = (int) (r % n_blk);
+    const T *     xr  = src + r * FWHT_I8_N;
+    const float * sg  = has_signs ? signs + (int64_t) blk * FWHT_I8_N : nullptr;
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        reg[i] = fwht_i8_load(xr[i * NT + tid]) * scale;
+        if (has_signs) {
+            reg[i] *= sg[i * NT + tid];
+        }
+    }
+    ggml_cuda_fwht_block_butterfly<FWHT_I8_N, NT>(reg, s, tid, tid % 32);
+
+    float m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        m = fmaxf(m, fabsf(reg[i]));
+    }
+    m = block_reduce<block_reduce_method::MAX, NT>(m, red);
+    if (tid == 0) {
+        blk_max[r] = m;
+    }
+}
+
+// One block per (row, transform block). Rebuilds the row scale from the block maxima, redoes the
+// butterfly and writes this block's share of the row's int8 codes.
+template <int NT, typename T, bool has_signs>
+__global__ __launch_bounds__(NT, 1) void fwht_i8_quant_kernel(
+        const T * __restrict__ src, const float * __restrict__ signs, const float * __restrict__ blk_max,
+        signed char * __restrict__ q, float * __restrict__ ascale, const int64_t n_rows,
+        const float scale, const int n_blk, const int K) {
+    constexpr int NE = FWHT_I8_N / NT;
+    __shared__ float s[FWHT_I8_N];
+
+    const int64_t r = blockIdx.x;
+    if (r >= n_rows) {
+        return;
+    }
+    const int     tid = threadIdx.x;
+    const int64_t row = r / n_blk;
+    const int     blk = (int) (r % n_blk);
+    const T *     xr  = src + r * FWHT_I8_N;
+    const float * sg  = has_signs ? signs + (int64_t) blk * FWHT_I8_N : nullptr;
+
+    float amax = 0.0f;
+    for (int i = 0; i < n_blk; ++i) {
+        amax = fmaxf(amax, blk_max[row * n_blk + i]);
+    }
+    const float d    = amax > 0.0f ? amax / 127.0f : 0.0f;
+    const float dinv = d > 0.0f ? 1.0f / d : 0.0f;
+    if (tid == 0) {
+        ascale[row] = d;
+    }
+
+    float reg[NE];
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        reg[i] = fwht_i8_load(xr[i * NT + tid]) * scale;
+        if (has_signs) {
+            reg[i] *= sg[i * NT + tid];
+        }
+    }
+    ggml_cuda_fwht_block_butterfly<FWHT_I8_N, NT>(reg, s, tid, tid % 32);
+
+    // The butterfly keeps element i*NT + tid, the fragment-tiled store wants k..k+3 in one thread.
+    // Round-trip through LDS (free after the butterfly) so the four codes are one 32-bit store.
+#pragma unroll
+    for (int i = 0; i < NE; ++i) {
+        s[i * NT + tid] = reg[i];
+    }
+    __syncthreads();
+
+    const int64_t k   = (int64_t) blk * FWHT_I8_N + 4 * tid;
+    const int64_t pos = ((row >> 4) * (K >> 4) + (k >> 4)) * 256
+                      + (int) ((row & 15) + 16 * ((k >> 3) & 1)) * 8 + (int) (k & 7);
+    const float4 v = *(const float4 *) &s[4 * tid];
+    const int qa = __float2int_rn(v.x * dinv);
+    const int qb = __float2int_rn(v.y * dinv);
+    const int qc = __float2int_rn(v.z * dinv);
+    const int qe = __float2int_rn(v.w * dinv);
+    const unsigned int t0 = __builtin_amdgcn_perm((unsigned) qb, (unsigned) qa, 0x0400u);
+    const unsigned int t1 = __builtin_amdgcn_perm((unsigned) qe, (unsigned) qc, 0x0400u);
+    *(uint32_t *) (q + pos) = __builtin_amdgcn_perm(t1, t0, 0x05040100u);
+}
+
+// Ready-made int8 codes for one consuming PTQ1_0 matmul, keyed by that matmul's own output tensor.
+// The tensor object is unique within a graph and each consumer runs once per execution, so a lookup
+// is exact and the entry is erased on the way out. Keying on the activation buffer instead would need
+// a staleness heuristic, because the graph allocator reuses activation addresses across layers.
+struct ggml_rad_fwht_i8_act {
+    signed char * q;
+    float *       scale;
+    int64_t       K, M;
+};
+static std::unordered_map<const void *, ggml_rad_fwht_i8_act> ggml_rad_fwht_i8_acts;
+
+// Per (device, K) scratch for the block maxima and the row scales. A separate map from the fp8 and
+// int8 activation sets, so nothing here is reachable from a non-PTQ1_0 matmul.
+struct ggml_rad_fwht_i8_buf {
+    float * bmax;
+    float * scale;
+    int64_t M;
+};
+static std::map<std::pair<int, int64_t>, ggml_rad_fwht_i8_buf> ggml_rad_fwht_i8_bufs;
+
+void ggml_rad_fwht_i8_acts_reset(void) {
+    ggml_rad_fwht_i8_acts.clear();
+}
+
+void ggml_rad_fwht_i8_act_register(const void * consumer, signed char * q, float * scale,
+                                   int64_t K, int64_t M) {
+    ggml_rad_fwht_i8_acts[consumer] = { q, scale, K, M };
+}
+
+bool ggml_rad_fwht_i8_act_lookup(const void * consumer, int64_t K, int64_t M,
+                                 signed char ** q, float ** scale) {
+    auto it = ggml_rad_fwht_i8_acts.find(consumer);
+    if (it == ggml_rad_fwht_i8_acts.end() || it->second.K != K || it->second.M != M) {
+        return false;
+    }
+    *q     = it->second.q;
+    *scale = it->second.scale;
+    ggml_rad_fwht_i8_acts.erase(it);
+    return true;
+}
+
+// Make sure the scratch for (M, K) exists. Returns false under stream capture when it does not,
+// because growing it would issue an illegal cudaMalloc inside the capture. The graph's warmup runs
+// uncaptured, so a shape seen there is already allocated by the time its graph is captured.
+bool ggml_cuda_radiance_fwht_i8_reserve(int64_t M, int64_t K, cudaStream_t stream) {
+    const int dev = ggml_cuda_get_device();
+    auto key = std::make_pair(dev, K);
+    auto it  = ggml_rad_fwht_i8_bufs.find(key);
+    if (it != ggml_rad_fwht_i8_bufs.end() && it->second.M >= M) {
+        return true;
+    }
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+        return false;
+    }
+    if (it != ggml_rad_fwht_i8_bufs.end()) {
+        cudaFree(it->second.bmax);
+        cudaFree(it->second.scale);
+        ggml_rad_fwht_i8_bufs.erase(it);
+    }
+    ggml_rad_fwht_i8_buf b = { nullptr, nullptr, 0 };
+    const int64_t Mcap = std::max<int64_t>(M, 4096);
+    const int64_t nb   = K / FWHT_I8_N;
+    cudaMalloc((void **) &b.bmax,  (size_t) Mcap * nb * sizeof(float));
+    cudaMalloc((void **) &b.scale, (size_t) Mcap * sizeof(float));
+    b.M = Mcap;
+    ggml_rad_fwht_i8_bufs.emplace(key, b);
+    return true;
+}
+
+// x is the transform input viewed as [FWHT_I8_N, M * n_blk] contiguous and q the transform output,
+// whose buffer is reused for the int8 codes. Returns the row scales, or null on any refusal.
+float * ggml_cuda_radiance_fwht_quant_i8(const void * x, bool x_f32, const float * signs, int n_blk,
+                                         void * q, int64_t K, int64_t M, cudaStream_t stream) {
+    if (n_blk <= 0 || (int64_t) n_blk * FWHT_I8_N != K) {
+        return nullptr;
+    }
+    if (!ggml_cuda_radiance_fwht_i8_reserve(M, K, stream)) {
+        return nullptr;
+    }
+    ggml_rad_fwht_i8_buf & b = ggml_rad_fwht_i8_bufs[std::make_pair(ggml_cuda_get_device(), K)];
+
+    const int64_t rows = M * n_blk;
+    const dim3 grid((unsigned) rows);
+    constexpr int NTH = 256;
+    const float sc = 1.0f / sqrtf((float) FWHT_I8_N);
+
+#define RAD_FWHT_I8_DISPATCH(T_, SG_)                                                             \
+    do {                                                                                          \
+        fwht_i8_blkmax_kernel<NTH, T_, SG_><<<grid, NTH, 0, stream>>>(                            \
+            (const T_ *) x, signs, b.bmax, rows, sc, n_blk);                                      \
+        fwht_i8_quant_kernel<NTH, T_, SG_><<<grid, NTH, 0, stream>>>(                             \
+            (const T_ *) x, signs, b.bmax, (signed char *) q, b.scale, rows, sc, n_blk, (int) K); \
+    } while (0)
+
+    if (x_f32) {
+        if (signs) { RAD_FWHT_I8_DISPATCH(float, true);  }
+        else       { RAD_FWHT_I8_DISPATCH(float, false); }
+    } else {
+        if (signs) { RAD_FWHT_I8_DISPATCH(half, true);  }
+        else       { RAD_FWHT_I8_DISPATCH(half, false); }
+    }
+#undef RAD_FWHT_I8_DISPATCH
+
+    return b.scale;
 }
 
 void ggml_cuda_radiance_quantize_tokens(const float * x, int64_t sx, int64_t K, int64_t M,

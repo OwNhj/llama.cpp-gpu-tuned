@@ -160,6 +160,13 @@ static void ggml_cuda_free_radiance_weights() {
     g_radiance_weights.clear();
 }
 
+// true when the radiance weight caches already hold this weight on the current device, so a
+// matmul reading it cannot lose the radiance path to a capture-time repack miss.
+bool ggml_cuda_radiance_weight_ready(const void * w) {
+    auto it = g_radiance_weights.find(w);
+    return it != g_radiance_weights.end() && it->second.device == ggml_cuda_get_device();
+}
+
 // the repack cache is keyed by the weight tensor's device pointer. when a model's CUDA buffer
 // is freed the keys become dangling: the next load may reuse the same address (stale repacked
 // weights) or a different one (leaked repacks -> OOM across reloads). drop every cache entry
@@ -288,10 +295,14 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
         // reuse the fused producer's e4m3
     } else if (ptq1) {
         signed char * q8s = nullptr;
-        ggml_cuda_radiance_quantize_tokens_i8((const float *) src1->data, src1->nb[1] / sizeof(float),
-                                              K, M, &q8s, &as, stream);
-        if (q8s == nullptr) {
-            return false;   // act scratch realloc declined under capture, fall back to MMQ
+        // A fused Hadamard producer may already have written this activation's int8 codes and row
+        // scales; only PTQ1_0 activations ever land in that registry (see ggml_cuda_try_fwht_quant_i8).
+        if (!ggml_rad_fwht_i8_act_lookup(dst->data, K, M, &q8s, &as)) {
+            ggml_cuda_radiance_quantize_tokens_i8((const float *) src1->data, src1->nb[1] / sizeof(float),
+                                                  K, M, &q8s, &as, stream);
+            if (q8s == nullptr) {
+                return false;   // act scratch realloc declined under capture, fall back to MMQ
+            }
         }
         q8 = (unsigned char *) q8s;
     } else {
