@@ -713,9 +713,7 @@ static __device__ __forceinline__ float ptq1_h2f(unsigned int h) {
 // D_row is the row's largest d, stored as fp16, so d/D_row lands in (0,1] and the 7-bit
 // code uses the whole int8 range. A power-of-two D_row would waste up to half of it,
 // which measured 0.303% weight error against 0.227% for the exact scale.
-static __device__ __forceinline__ unsigned int ptq1_0_i8_mag(const unsigned char * __restrict__ blk,
-                                                            unsigned int rcp_bits) {
-    const unsigned int h = (unsigned int) blk[26] | ((unsigned int) blk[27] << 8);
+static __device__ __forceinline__ unsigned int ptq1_0_i8_mag(unsigned int h, unsigned int rcp_bits) {
     const float d   = ptq1_h2f(h);
     const float rcp = __uint_as_float(rcp_bits);
     int q = (int) rintf(d * rcp);
@@ -849,6 +847,17 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
       else                       wref[it] = *(const unsigned short *)(Wref + wrc[it]);
     } else wref[it] = Wref[n0 + wrc[it]];
   }
+  // PTQ1_0 normalises each block's d against the row max, and that quotient depends only on
+  // the row. Every slot a thread owns has row tid % BNF_T, so one register serves the whole
+  // K loop and the per-slab build through shared memory disappears. min(n0 + row, N - 1) is
+  // the same clamp wrc applies.
+  unsigned int rc_bits = 0;
+  if constexpr (PTQ1) {
+    const int lr = tid % BNF_T;
+    const int rr = n0 + lr < N ? n0 + lr : N - 1;
+    const float drow = ptq1_h2f(*(const unsigned short *) (Wref + 2 * rr));
+    rc_bits = __float_as_uint(drow > 0.0f ? 127.0f / drow : 0.0f);
+  }
 
   // PTQ1 accumulates in int32 (the i8 WMMA's native form); every other path in float.
   using acc_t = typename std::conditional<PTQ1, int32x8_t, floatx8>::type;
@@ -929,24 +938,12 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
       // /16 gives the 16-element group index within the block.
       const int kblk = k0 / 128;
       const int nbk  = K / 128;
-      // M = round(d * 127/D_row) depends only on (row, k-slab), but the eight threads that
-      // share a row each recompute it, division included. Build the tile's table once.
-      __shared__ unsigned int sM8[BNF_T];
-      if (tid < BNF_T) {
-        const int gr = n0 + tid;
-        const int rr = gr < N ? gr : N - 1;
-        const unsigned int * __restrict__ bw8 =
-            (const unsigned int *) (W + ((size_t) rr * nbk + kblk) * 28);
-        const float drow = ptq1_h2f(*(const unsigned short *) (Wref + 2 * rr));
-        sM8[tid] = ptq1_0_i8_mag((const unsigned char *) bw8,
-                                 __float_as_uint(drow > 0.0f ? 127.0f / drow : 0.0f));
-      }
-      radiance_lds_barrier();
 #pragma unroll
       for (int it = 0; it < NW; ++it) {
         const unsigned int * __restrict__ bw =
             (const unsigned int *) (W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * 28);
-        const unsigned int M = sM8[wrc[it]];
+        // The block's own d is the high half of the word the decode already reads for qh.
+        const unsigned int M = ptq1_0_i8_mag(bw[6] >> 16, rc_bits);
         unsigned int tr[4];
         // wcol[it] is a PACKED BYTE column in [0, LBK/2): byte column c covers elements
         // 2c and 2c+1, so the 16-element group a slot writes starts at (wcol*2) & ~15.
