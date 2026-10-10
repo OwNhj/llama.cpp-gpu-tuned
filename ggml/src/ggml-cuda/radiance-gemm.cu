@@ -638,22 +638,30 @@ static __device__ __forceinline__ void ptq1_0_decode16(const unsigned char * __r
 // nz is one per non-zero lane so nz*M places M in exactly those bytes; the sign
 // comes from the trit's own high bit, and (0x100 - M) is -M for the negative ones.
 static __device__ __forceinline__ unsigned int ptq1_0_trit_to_i8(unsigned int t, unsigned int M) {
-    const unsigned int nz   = (t | (t >> 7)) & 0x01010101u;   // 1 where trit != 0
-    const unsigned int neg  = (t >> 7) & 0x01010101u;         // 1 where trit == -1
-    const unsigned int mag  = nz * M;
-    const unsigned int nmag = nz * ((0x100u - M) & 0xFFu);
-    return (mag & ~(neg * 0xFFu)) | (nmag & (neg * 0xFFu));
+    // Trit bytes are 0x00 / 0x01 / 0xFF, so (t & 3) is 0 / 1 / 3 and a 4-entry byte
+    // table {0, +M, 0, -M} in v_perm's second operand resolves all four lanes at once.
+    // v_perm index v in 0..3 reads the second argument's byte v.
+    const unsigned int tab = ((M & 0xFFu) << 8) | (((0x100u - M) & 0xFFu) << 24);
+    return __builtin_amdgcn_perm(0u, tab, t & 0x03030303u);
 }
 
-// Row-normalised int8 magnitude for one block. The row scale D_row = 2^(Wref-127)
-// is applied once in the epilogue, so the weight carries round(d/D_row * 127).
+// Positive-normal fp16 -> fp32 by bit splicing. Every d in this format is a positive
+// normal (measured: 0.0037 .. 0.0599), so the subnormal and sign cases do not arise.
+static __device__ __forceinline__ float ptq1_h2f(unsigned int h) {
+    return h == 0u ? 0.0f
+                   : __uint_as_float(((((h >> 10) & 0x1Fu) + 112u) << 23) | ((h & 0x3FFu) << 13));
+}
+
+// Row-normalised int8 magnitude for one block: round(d * rcp) with rcp = 127/D_row.
+// D_row is the row's largest d, stored as fp16, so d/D_row lands in (0,1] and the 7-bit
+// code uses the whole int8 range. A power-of-two D_row would waste up to half of it,
+// which measured 0.303% weight error against 0.227% for the exact scale.
 static __device__ __forceinline__ unsigned int ptq1_0_i8_mag(const unsigned char * __restrict__ blk,
-                                                            unsigned int wref_byte) {
+                                                            unsigned int rcp_bits) {
     const unsigned int h = (unsigned int) blk[26] | ((unsigned int) blk[27] << 8);
-    const float d = (1.0f + (float) (h & 0x3FFu) * (1.0f / 1024.0f))
-                  * exp2f((float) ((int) ((h >> 10) & 0x1Fu) - 15));
-    const float drow = exp2f((float) ((int) wref_byte - 127));
-    int q = (int) rintf(d / drow * 127.0f);
+    const float d   = ptq1_h2f(h);
+    const float rcp = __uint_as_float(rcp_bits);
+    int q = (int) rintf(d * rcp);
     if (q > 127) q = 127;
     if (q < 0)   q = 0;
     return (unsigned int) q;
@@ -761,10 +769,15 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
       wkst[it] = 0; wlanec[it] = 0;
     }
   }
-  unsigned int wref[NW];   // per-row max exponent(s): one byte, or WSLOTS packed under WPERM
+  unsigned int wref[NW];   // per-row factor: an e8m0 byte, WSLOTS packed bytes, or (PTQ1)
+                           // the float bits of 127/D_row
 #pragma unroll
   for (int it = 0; it < NW; ++it) {
-    if constexpr (WPERM) {
+    if constexpr (PTQ1) {
+      const unsigned int h = *(const unsigned short *) (Wref + 2 * (n0 + wrc[it]));
+      const float drow = ptq1_h2f(h);
+      wref[it] = __float_as_uint(drow > 0.0f ? 127.0f / drow : 0.0f);
+    } else if constexpr (WPERM) {
       if constexpr (WSLOTS == 4) wref[it] = *(const unsigned int *)(Wref + wrc[it]);
       else                       wref[it] = *(const unsigned short *)(Wref + wrc[it]);
     } else wref[it] = Wref[n0 + wrc[it]];
@@ -993,10 +1006,16 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
 #pragma unroll
   for (int j = 0; j < TN; ++j) {
     const int n = n0 + wn * TN * 16 + j * 16 + col;
-    // PTQ1 stores the weight as trit * round(d/D_row * 127), so the row factor carries
-    // a 1/127 the MXFP4 paths do not have. Everything else is identical.
-    const float q = PTQ1 ? (1.0f / 127.0f) : 1.0f;
-    rf[j] = (n < N) ? __int_as_float((int)Wref[n] << 23) * q : 0.f;
+    if constexpr (PTQ1) {
+      // D_row is fp16; the staged weight already carries the 127, so undo it here.
+      rf[j] = 0.f;
+      if (n < N) {
+        const unsigned int h = *(const unsigned short *) (Wref + 2 * n);
+        rf[j] = ptq1_h2f(h) * (1.0f / 127.0f);
+      }
+    } else {
+      rf[j] = (n < N) ? __int_as_float((int)Wref[n] << 23) : 0.f;
+    }
   }
   {
     __bf16 *__restrict__ Cb = C + (size_t)(m0 + wm * TM * 16) * N;
@@ -2281,9 +2300,8 @@ __global__ void radiance_gather_scales_mxfp6_kernel(const unsigned char * __rest
 }
 
 // PTQ1_0 zero-copy: W aliases the checkpoint's 28-byte blocks, so there is no scale
-// plane to gather. Only Wref is needed: the row's largest fp16 exponent field, mapped to
-// the e8m0 convention the epilogue uses (rf = 2^(Wref[n]-127)). The staged weight is
-// round(d / 2^(Wref-127) * 127), so Wref is the row normaliser, not a lossless bound.
+// plane to gather. Only Wref is needed: the row's largest d, kept as fp16. The staged
+// weight is round(d / D_row * 127) and the epilogue multiplies D_row/127 back in.
 // Measured on the real checkpoint a row's d spans at most ~2 binades below its max.
 __global__ void radiance_gather_scales_ptq1_kernel(const unsigned char * __restrict__ src,
                                                    int N, int K, unsigned char * __restrict__ Wref) {
@@ -2295,8 +2313,8 @@ __global__ void radiance_gather_scales_ptq1_kernel(const unsigned char * __restr
     unsigned int lmax = 0;
     for (int b = tid; b < nb; b += stride) {
         const unsigned int h = (unsigned int) row[b * 28 + 26] | ((unsigned int) row[b * 28 + 27] << 8);
-        const unsigned int e = (h >> 10) & 0x1Fu;      // fp16 biased exponent field
-        if (e > lmax) lmax = e;
+        const unsigned int v = h & 0x7FFFu;   // positive fp16: the bit pattern orders like the value
+        if (v > lmax) lmax = v;
     }
     __shared__ unsigned int sh[256];
     sh[tid] = lmax;
@@ -2305,12 +2323,12 @@ __global__ void radiance_gather_scales_ptq1_kernel(const unsigned char * __restr
         if (tid < off && sh[tid + off] > sh[tid]) sh[tid] = sh[tid + off];
         __syncthreads();
     }
-    // The row normaliser must be >= every d in the row, and a block with exponent e holds
-    // d in [2^e, 2^(e+1)). Taking the next binade above the row max keeps round(d/drow*127)
-    // inside [0,127] for every block; using e_max itself would push the largest block to
-    // 254 and clamp half its magnitude away. fp16 biased exponent -> unbiased e_max ->
-    // e8m0 biased (e_max + 1) + 127 == exp_field + 113.
-    if (tid == 0) Wref[n] = (unsigned char) (sh[0] + 113u);
+    // The row normaliser must be >= every d in the row. Storing the row's largest d
+    // itself (as fp16) keeps round(d/D_row * 127) inside [0,127] and loses nothing: an
+    // earlier power-of-two normaliser had to sit a binade above the max, which cost half
+    // the code range on the largest block and measured 0.303% weight error against
+    // 0.227% here.
+    if (tid == 0) ((unsigned short *) Wref)[n] = (unsigned short) sh[0];
 }
 
 void ggml_cuda_radiance_gather_scales_ptq1(const unsigned char * src, int N, int K,
@@ -2437,6 +2455,8 @@ __global__ void quantize_tokens_i8(const float * __restrict__ x, int64_t sx, int
     }
     __syncthreads();
     const float d = scale[row];
+    // d = amax/127, so |x*dinv| <= 127 for every element and the low byte of the
+    // rounded int is already the saturated value: no clamp is needed before the pack.
     const float dinv = d > 0.0f ? 1.0f / d : 0.0f;
     const int64_t Kt = K >> 4;
     const int64_t frag_row = (row >> 4) * Kt;
@@ -2447,12 +2467,9 @@ __global__ void quantize_tokens_i8(const float * __restrict__ x, int64_t sx, int
         const int qb = __float2int_rn((b) * dinv);                                 \
         const int qc = __float2int_rn((c) * dinv);                                 \
         const int qe = __float2int_rn((e_) * dinv);                                \
-        const int ca = qa < -127 ? -127 : (qa > 127 ? 127 : qa);                   \
-        const int cb = qb < -127 ? -127 : (qb > 127 ? 127 : qb);                   \
-        const int cc = qc < -127 ? -127 : (qc > 127 ? 127 : qc);                   \
-        const int ce = qe < -127 ? -127 : (qe > 127 ? 127 : qe);                   \
-        *(uint32_t *) (q + pos) = (uint32_t)(ca & 0xFF) | ((uint32_t)(cb & 0xFF) << 8) \
-                                | ((uint32_t)(cc & 0xFF) << 16) | ((uint32_t)(ce & 0xFF) << 24); \
+        const unsigned int t0 = __builtin_amdgcn_perm((unsigned) qb, (unsigned) qa, 0x0400u); \
+        const unsigned int t1 = __builtin_amdgcn_perm((unsigned) qe, (unsigned) qc, 0x0400u); \
+        *(uint32_t *) (q + pos) = __builtin_amdgcn_perm(t1, t0, 0x05040100u);      \
     } while (0)
     if (NIT > 0) {
 #pragma unroll

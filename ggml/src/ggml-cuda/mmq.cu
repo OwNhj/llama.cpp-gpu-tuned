@@ -233,7 +233,8 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
         w.device = device;
         const size_t wq_bytes  = (size_t)N * K / 2;
         const size_t ws_bytes  = (size_t)N * (K / 32);
-        const size_t wref_bytes = (size_t)N;
+        // PTQ1_0 keeps the row normaliser as fp16; every other type uses one e8m0 byte.
+        const size_t wref_bytes = src0->type == GGML_TYPE_PTQ1_0 ? (size_t) 2 * N : (size_t) N;
         if (src0->type == GGML_TYPE_MXFP6) {
             // MXFP6 zero-copy: the atiled E6PACK path reads the checkpoint's packed 6-bit bytes
             // in place and folds them to e4m3, so W aliases the weight buffer and there is no
