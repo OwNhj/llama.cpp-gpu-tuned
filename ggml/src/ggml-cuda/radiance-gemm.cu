@@ -925,6 +925,19 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
       // /16 gives the 16-element group index within the block.
       const int kblk = k0 / 128;
       const int nbk  = K / 128;
+      // M = round(d * 127/D_row) depends only on (row, k-slab), but the eight threads that
+      // share a row each recompute it, division included. Build the tile's table once.
+      __shared__ unsigned int sM8[BNF_T];
+      if (tid < BNF_T) {
+        const int gr = n0 + tid;
+        const int rr = gr < N ? gr : N - 1;
+        const unsigned int * __restrict__ bw8 =
+            (const unsigned int *) (W + ((size_t) rr * nbk + kblk) * 28);
+        const float drow = ptq1_h2f(*(const unsigned short *) (Wref + 2 * rr));
+        sM8[tid] = ptq1_0_i8_mag((const unsigned char *) bw8,
+                                 __float_as_uint(drow > 0.0f ? 127.0f / drow : 0.0f));
+      }
+      radiance_lds_barrier();
 #pragma unroll
       for (int it = 0; it < NW; ++it) {
         const unsigned int * __restrict__ bw =
@@ -934,8 +947,7 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
         const unsigned int q0 = bw[0], q1 = bw[1], q2 = bw[2], q3 = bw[3];
         const unsigned int q4 = bw[4], q5 = bw[5];
         const unsigned int qh = bw[6] & 0xFFFFu;   // bytes 24..25
-        const unsigned char * __restrict__ blk = (const unsigned char *) bw;
-        const unsigned int M = ptq1_0_i8_mag(blk, wref[it]);
+        const unsigned int M = sM8[wrc[it]];
         unsigned int tr[4];
         // wcol[it] is a PACKED BYTE column in [0, LBK/2): byte column c covers elements
         // 2c and 2c+1, so the 16-element group a slot writes starts at (wcol*2) & ~15.
