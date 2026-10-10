@@ -28,6 +28,13 @@ bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t 
 
 // fused GLU fast path (B1): produce down-GEMM fp8 alongside y. lookup/registry span one graph.
 bool ggml_cuda_try_swiglu_quant_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+
+// fused add + rms norm + weight mul + per-token fp8 (A2). act_key is the tensor whose rows were
+// quantized (the norm output mul->data); the following radiance GEMM finds it by that pointer.
+bool ggml_cuda_radiance_add_rms_norm_quant(const float * a, const float * b, const float * weight,
+                                           float * residual, float * norm, const void * act_key,
+                                           int64_t ncols, int64_t nrows, float eps,
+                                           cudaStream_t stream);
 bool ggml_rad_fused_act_lookup(const void * act, int64_t K,
                                const unsigned char ** q, const float ** scale);
 void ggml_rad_fused_acts_reset(void);

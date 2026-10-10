@@ -2872,6 +2872,66 @@ static bool ggml_cuda_should_fuse_add_rms_norm(const ggml_tensor * add,
     return ggml_get_op_params_f32(rms_norm, 0) >= 0.0f;
 }
 
+// True when the only consumer of the norm output is a radiance prefill GEMM, in which case the
+// fused kernel can produce that GEMM's activation and the separate quantize pass is not needed.
+// The scan stops at the first node that reads the norm, so a norm feeding anything else (or a
+// non-radiance matmul) leaves the unfused path alone.
+static bool ggml_cuda_try_add_rms_norm_quant_fused(ggml_backend_cuda_context & ctx,
+                                                   const ggml_cgraph * cgraph, int node_idx,
+                                                   ggml_tensor * add, ggml_tensor * rms_norm,
+                                                   ggml_tensor * mul) {
+    if (getenv("GGML_RAD_DISABLE") || getenv("GGML_RAD_FUSE_OFF") || getenv("GGML_RAD_NORM_QUANT_OFF")) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc) || !amd_wmma_available(cc)) {
+        return false;
+    }
+
+    // Bounded lookahead: the consumer is adjacent in practice, and an unbounded scan over a graph
+    // with thousands of nodes would cost more than the fusion saves.
+    const ggml_tensor * mm = nullptr;
+    const int last = std::min(cgraph->n_nodes, node_idx + 13);
+    for (int j = node_idx + 3; j < last; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        bool reads = false;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            reads = reads || n->src[s] == mul;
+        }
+        if (!reads) {
+            continue;
+        }
+        if (n->op == GGML_OP_MUL_MAT && n->src[1] == mul) {
+            mm = n;
+        }
+        break;   // the first reader decides
+    }
+    if (mm == nullptr || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    if (weight->type != GGML_TYPE_F32 || !ggml_is_contiguous(weight)) {
+        return false;
+    }
+    const int64_t K = w->ne[0];
+    const int64_t N = w->ne[1];
+    const int64_t M = mul->ne[1];
+    if (!ggml_cuda_radiance_supported(cc, w->type, K, N, M, mul->ne[0], true)) {
+        return false;
+    }
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    return ggml_cuda_radiance_add_rms_norm_quant(
+        (const float *) add->src[0]->data, (const float *) add->src[1]->data,
+        (const float *) weight->data, (float *) add->data, (float *) mul->data,
+        (const void *) mul->data, add->ne[0],
+        add->ne[1] * add->ne[2] * add->ne[3], eps, ctx.stream());
+}
+
 // A Hadamard rotation of an activation ([MUL signs, RESHAPE,] MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD)
 // whose every use is a PTQ1_0 mat-vec on the mmvq path does not need to exist in F32: each of those
 // mat-vecs quantizes it to q8_1 straight away, so the transform kernel quantizes as it goes and writes
@@ -4575,6 +4635,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return !env || std::atoi(env) != 0;
         }();
         if (add_rms_norm_fusion) {
+            if (ggml_cuda_try_add_rms_norm_quant_fused(*cuda_ctx, cgraph, i, node,
+                                                       cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+                return 2;
+            }
             ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
             return 2;
         }

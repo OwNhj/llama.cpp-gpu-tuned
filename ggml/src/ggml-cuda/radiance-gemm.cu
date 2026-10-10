@@ -2381,6 +2381,11 @@ struct ggml_rad_fused_act {
     unsigned char * q;
     float * scale;
     int64_t K;
+    // A one-shot entry is erased by the first lookup. The map is keyed by a data pointer and the
+    // graph allocator reuses addresses across layers, so a producer whose activation width repeats
+    // every layer (the norm output, K = n_embd) could otherwise hand a later layer the previous
+    // layer's q. Producers with exactly one consumer set this.
+    bool once;
 };
 static std::unordered_map<const void *, ggml_rad_fused_act> ggml_rad_fused_acts;
 
@@ -2396,6 +2401,129 @@ bool ggml_rad_fused_act_lookup(const void * act, int64_t K,
     }
     *q = it->second.q;
     *scale = it->second.scale;
+    if (it->second.once) {
+        ggml_rad_fused_acts.erase(it);
+    }
+    return true;
+}
+
+// ===================== fused add + RMS norm + weight mul + per-token fp8 (A2) ===================
+//
+// The post-attention sequence ADD -> RMS_NORM -> MUL, plus the per-token e4m3 that the following
+// radiance GEMM would otherwise build in its own pass. Saves the quantize kernel's read of the f32
+// norm and one launch. The residual (add->data) and the f32 norm (mul->data) are still written:
+// other consumers read them.
+//
+// The reduction runs exactly like norm.cu's add_rms_norm_f32<block_size>: one strided scalar
+// accumulation per thread, then block_reduce<SUM>. The norm values therefore stay bit-identical to
+// the unfused kernel, and the amax below sees the same f32 values the standalone quantize pass
+// would read back, in the same expression order (rscale * residual * weight).
+template <int NTH, int NIT>
+__global__ void add_rms_quant_fused_kernel(
+        const float * __restrict__ a, const float * __restrict__ b,
+        const float * __restrict__ weight, float * __restrict__ residual,
+        float * __restrict__ dst, unsigned char * __restrict__ q,
+        float * __restrict__ scale, uint2 * __restrict__ hashes, int ncols, float eps) {
+    const int64_t row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float * ar = a + row * ncols;
+    const float * br = b + row * ncols;
+    float * rr = residual + row * ncols;
+    float * dr = dst + row * ncols;
+
+    __shared__ float lds[NTH / 32];
+    __shared__ float lds2[NTH / 32];
+
+    float tmp = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NIT; ++i) {
+        const int col = tid + i * NTH;
+        if (col < ncols) {
+            const float xi = __fadd_rn(ar[col], br[col]);
+            rr[col] = xi;
+            tmp += xi * xi;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, NTH>(tmp, lds);
+    const float rscale = rsqrtf(tmp / ncols + eps);
+
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NIT; ++i) {
+        const int col = tid + i * NTH;
+        if (col < ncols) {
+            const float v = rscale * rr[col] * weight[col];
+            dr[col] = v;
+            amax = fmaxf(amax, fabsf(v));
+        }
+    }
+    amax = block_reduce<block_reduce_method::MAX, NTH>(amax, lds2);
+    const float d = amax > 0.0f ? amax / 448.0f : 0.0f;
+    if (tid == 0) {
+        scale[row] = d;
+        // q is written unconditionally, so retire this row's memo signature. A later
+        // quantize_tokens_fp8 call shares this (device, K) buffer; if it saw the previous
+        // execution's signature it would take the skip branch and leave these bytes in place for a
+        // different tensor. ~0 can never equal a real signature, so it always recomputes.
+        hashes[row] = make_uint2(0xFFFFFFFFu, 0xFFFFFFFFu);
+    }
+    const float dinv = d > 0.0f ? 1.0f / d : 0.0f;
+    // Fragment-tiled layout, same position formula as quantize_tokens_fp8: a 16m x 16k fragment is
+    // 256 contiguous bytes and k..k+3 never straddles an 8-byte group, so one u32 store fits.
+    const int64_t Kt = ncols >> 4;
+    const int64_t frag_row = (row >> 4) * Kt;
+    const int lrow = (int) (row & 15);
+    for (int64_t k = tid * 4; k < ncols; k += (int64_t) NTH * 4) {
+        const float4 nv = *(const float4 *) (dr + k);
+        const uint32_t p0 = ggml_cuda_fp32x2_to_e4m3x2(nv.x * dinv, nv.y * dinv);
+        const uint32_t p1 = ggml_cuda_fp32x2_to_e4m3x2(nv.z * dinv, nv.w * dinv);
+        const int64_t pos = (frag_row + (k >> 4)) * 256 + (lrow + 16 * ((int) ((k >> 3) & 1))) * 8 + (k & 7);
+        *(uint32_t *) (q + pos) = (p0 & 0xFFFFu) | ((p1 & 0xFFFFu) << 16);
+    }
+}
+
+#define RAD_A2_DISPATCH(NTH_)                                                                     \
+    do {                                                                                          \
+        const int nit = (int) ((ncols + NTH_ - 1) / NTH_);                                         \
+        switch (nit) {                                                                             \
+            case 1: add_rms_quant_fused_kernel<NTH_, 1><<<grid, NTH_, 0, stream>>>(                \
+                        a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+            case 2: add_rms_quant_fused_kernel<NTH_, 2><<<grid, NTH_, 0, stream>>>(                \
+                        a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+            case 3: add_rms_quant_fused_kernel<NTH_, 3><<<grid, NTH_, 0, stream>>>(                \
+                        a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+            case 4: add_rms_quant_fused_kernel<NTH_, 4><<<grid, NTH_, 0, stream>>>(                \
+                        a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+            case 5: add_rms_quant_fused_kernel<NTH_, 5><<<grid, NTH_, 0, stream>>>(                \
+                        a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+            default: return false;                                                                 \
+        }                                                                                          \
+    } while (0)
+
+// Runs the fused kernel and registers q under act_key. Returns false when the shape is outside the
+// instantiated set or the scratch is unavailable, in which case the caller keeps the unfused path.
+bool ggml_cuda_radiance_add_rms_norm_quant(const float * a, const float * b, const float * weight,
+                                           float * residual, float * norm, const void * act_key,
+                                           int64_t ncols, int64_t nrows, float eps,
+                                           cudaStream_t stream) {
+    if (getenv("GGML_RAD_DISABLE") || getenv("GGML_RAD_FUSE_OFF") || getenv("GGML_RAD_NORM_QUANT_OFF")) {
+        return false;
+    }
+    if (ncols <= 0 || nrows <= 0 || (ncols % 16) != 0 || ncols > 5120) {
+        return false;
+    }
+    ggml_rad_act_buf bb = ggml_rad_act_get(nrows, ncols, stream);
+    if (bb.q == nullptr) {
+        return false;   // declined under capture
+    }
+    const dim3 grid((unsigned) nrows);
+    if (ncols < 1024) {
+        RAD_A2_DISPATCH(256);
+    } else {
+        RAD_A2_DISPATCH(1024);
+    }
+#undef RAD_A2_DISPATCH
+    ggml_rad_fused_acts[act_key] = { bb.q, bb.scale, ncols, true };
     return true;
 }
 
@@ -2463,6 +2591,6 @@ bool ggml_cuda_try_swiglu_quant_fused(ggml_backend_cuda_context & ctx, const ggm
     swiglu_quant_fused_kernel<<<grid, 256, 0, ctx.stream()>>>(
         (const float *) gate->data, (const float *) up->data, (float *) dst->data,
         b.q, b.scale, b.hashes, N, M, gs, us);
-    ggml_rad_fused_acts[dst->data] = { b.q, b.scale, N };
+    ggml_rad_fused_acts[dst->data] = { b.q, b.scale, N, false };
     return true;
 }
