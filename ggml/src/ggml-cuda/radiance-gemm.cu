@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <stdexcept>
 typedef float floatx8 __attribute__((ext_vector_type(8)));
+typedef int int32x8_t __attribute__((ext_vector_type(8)));
 typedef int int2_t __attribute__((ext_vector_type(2)));
 typedef unsigned int uint4_t __attribute__((ext_vector_type(4)));
 typedef unsigned int uint2_t __attribute__((ext_vector_type(2)));
@@ -579,8 +580,87 @@ static __device__ __forceinline__ void radiance_lds_barrier() {
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
+// ---- PTQ1_0 (type 143) staging helpers ----
+//
+// A 28-byte block holds 128 trits in base-3 packing plus one fp16 scale:
+//   qs[0..15]  5 trits/byte -> elements 0..79   (one trit index per 16 elements)
+//   qs[16..23] 5 trits/byte -> elements 80..119 (one trit index per 8 elements)
+//   qh[0..1]   4 trits/byte -> elements 120..127 (one trit index per 2 elements)
+//   d (fp16) at offset 26
+// Element order matches dequantize_row_ptq1_0 in ggml-quants.c. The value is
+// trit * d with trit in {-1,0,+1}.
+//
+// Decode the 16 trits starting at `base` (a multiple of 16) into four dwords of
+// four sign-extended int8 each (0xFF / 0x00 / 0x01).
+static __device__ __forceinline__ void ptq1_0_decode16(const unsigned char * __restrict__ blk,
+                                                       int base, unsigned int trit[4]) {
+    constexpr unsigned int kP3[5] = {1u, 3u, 9u, 27u, 81u};
+    const unsigned int * qs = (const unsigned int *) blk;   // 24 B, 4-byte aligned
+    const unsigned char * qh = blk + 24;
+    if (base < 80) {
+        const unsigned int pw = kP3[base >> 4];
+        trit[0] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[0], pw);
+        trit[1] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[1], pw);
+        trit[2] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[2], pw);
+        trit[3] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[3], pw);
+    } else if (base < 112) {
+        // two 8-element groups: trit index n then n+1
+        const unsigned int pw = kP3[(base - 80) >> 3];
+        trit[0] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[4], pw);
+        trit[1] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[5], pw);
+        trit[2] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[4], pw * 3u);
+        trit[3] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[5], pw * 3u);
+    } else {
+        // base == 112: elements 112..119 come from qs, 120..127 from qh
+        const unsigned int pw = kP3[4];
+        trit[0] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[4], pw);
+        trit[1] = (unsigned int) ptq1_0_decode4_int8_same_trit((int) qs[5], pw);
+        // elements 120..127: the byte alternates qh[0]/qh[1], trit index (e-120)>>1
+        unsigned int lo = 0, hi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned int a = (unsigned int) ptq1_0_trit_pow3(qh[0], kP3[j]) & 0xFFu;
+            const unsigned int b = (unsigned int) ptq1_0_trit_pow3(qh[1], kP3[j]) & 0xFFu;
+            if (j < 2) {
+                lo |= a << (8 * (2 * j));
+                lo |= b << (8 * (2 * j + 1));
+            } else {
+                hi |= a << (8 * (2 * (j - 2)));
+                hi |= b << (8 * (2 * (j - 2) + 1));
+            }
+        }
+        trit[2] = lo;
+        trit[3] = hi;
+    }
+}
+
+// Four packed sign-extended trits -> four int8 bytes: 0 -> 0, +1 -> M, -1 -> -M.
+// nz is one per non-zero lane so nz*M places M in exactly those bytes; the sign
+// comes from the trit's own high bit, and (0x100 - M) is -M for the negative ones.
+static __device__ __forceinline__ unsigned int ptq1_0_trit_to_i8(unsigned int t, unsigned int M) {
+    const unsigned int nz   = (t | (t >> 7)) & 0x01010101u;   // 1 where trit != 0
+    const unsigned int neg  = (t >> 7) & 0x01010101u;         // 1 where trit == -1
+    const unsigned int mag  = nz * M;
+    const unsigned int nmag = nz * ((0x100u - M) & 0xFFu);
+    return (mag & ~(neg * 0xFFu)) | (nmag & (neg * 0xFFu));
+}
+
+// Row-normalised int8 magnitude for one block. The row scale D_row = 2^(Wref-127)
+// is applied once in the epilogue, so the weight carries round(d/D_row * 127).
+static __device__ __forceinline__ unsigned int ptq1_0_i8_mag(const unsigned char * __restrict__ blk,
+                                                            unsigned int wref_byte) {
+    const unsigned int h = (unsigned int) blk[26] | ((unsigned int) blk[27] << 8);
+    const float d = (1.0f + (float) (h & 0x3FFu) * (1.0f / 1024.0f))
+                  * exp2f((float) ((int) ((h >> 10) & 0x1Fu) - 15));
+    const float drow = exp2f((float) ((int) wref_byte - 127));
+    int q = (int) rintf(d / drow * 127.0f);
+    if (q > 127) q = 127;
+    if (q < 0)   q = 0;
+    return (unsigned int) q;
+}
+
 template <int TN, bool WPERM, int LBK = BK, bool E6 = false, bool F32OUT = false, bool RADSC = false,
-          bool E6PACK = false, int TWM = WM, int TWN = WN>
+          bool E6PACK = false, int TWM = WM, int TWN = WN, bool PTQ1 = false>
 __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
@@ -690,13 +770,15 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
     } else wref[it] = Wref[n0 + wrc[it]];
   }
 
-  floatx8 acc[TM][TN];
+  // PTQ1 accumulates in int32 (the i8 WMMA's native form); every other path in float.
+  using acc_t = typename std::conditional<PTQ1, int32x8_t, floatx8>::type;
+  acc_t acc[TM][TN];
 #pragma unroll
   for (int i = 0; i < TM; ++i)
 #pragma unroll
     for (int j = 0; j < TN; ++j)
 #pragma unroll
-      for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.f;
+      for (int e = 0; e < 8; ++e) acc[i][j][e] = 0;
 
   for (int k0 = 0; k0 < K; k0 += LBK) {
     // A fragments straight from global: one SADDR clause, consumed only at the WMMAs.
@@ -759,6 +841,28 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
         pk[it] = uint4_t{wv0, wv1, 0u, 0u};
         hp[it] = uint2_t{h20, h21};
         wsv[it] = Wb[rowoff + (size_t) 6 * QK_MXFP6 / 8 + (size_t) (ksub % QK_MXFP6) / QK_MXFP6_SUB];
+      }
+    } else if constexpr (PTQ1) {
+      // PTQ1_0 zero-copy: read the checkpoint's 28-byte blocks in place. LBK == 128 ==
+      // QK_PTQ1_0, so one K-slab is exactly one block per row and the 16-element group
+      // a slot handles never straddles a block. wcol[it] is the element base in [0,128);
+      // /16 gives the 16-element group index within the block.
+      const int kblk = k0 / 128;
+      const int nbk  = K / 128;
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        const unsigned char * __restrict__ blk = W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * 28;
+        const unsigned int M = ptq1_0_i8_mag(blk, wref[it]);
+        unsigned int tr[4];
+        // wcol[it] is a PACKED BYTE column in [0, LBK/2): byte column c covers elements
+        // 2c and 2c+1. decode16 wants an element base that is a multiple of 16, and the
+        // eight bytes a slot writes are a contiguous 16-element group, so the base is
+        // (wcol*2) rounded down to the group start.
+        ptq1_0_decode16(blk, (wcol[it] * 2) & ~15, tr);
+        unsigned int outw[4];
+#pragma unroll
+        for (int h = 0; h < 4; ++h) outw[h] = ptq1_0_trit_to_i8(tr[h], M);
+        *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = uint4_t{outw[0], outw[1], outw[2], outw[3]};
       }
     } else {
       const unsigned char *__restrict__ Wb = W + (size_t)__builtin_amdgcn_readfirstlane((int)(((size_t)n0 * K + k0) / 2));
@@ -829,6 +933,8 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
         *(uint2_t *) &sW[wrow[it] * LWSTR + wcol[it] + 8] =
             e2m3_unpack8(pk[it][1], hp[it][1], t[0], t[1], t[2]);
       }
+    } else if constexpr (PTQ1) {
+      // Already int8 in the staging branch above (trit * row-normalised magnitude).
     } else {
 #pragma unroll
       for (int it = 0; it < NW; ++it) {
@@ -868,8 +974,16 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
 #pragma unroll
       for (int i = 0; i < TM; ++i)
 #pragma unroll
-        for (int j = 0; j < TN; ++j)
-          acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][step], wf[j], acc[i][j]);
+        for (int j = 0; j < TN; ++j) {
+          if constexpr (PTQ1) {
+            // Same lane convention as the fp8 WMMA, i32 accumulator (no rounding).
+            const int2_t av = *(const int2_t *) &af[i][step];
+            const int2_t bv = *(const int2_t *) &wf[j];
+            acc[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, av, true, bv, acc[i][j], true);
+          } else {
+            acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i][step], wf[j], acc[i][j]);
+          }
+        }
     }
     radiance_lds_barrier();
   }
@@ -879,7 +993,10 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
 #pragma unroll
   for (int j = 0; j < TN; ++j) {
     const int n = n0 + wn * TN * 16 + j * 16 + col;
-    rf[j] = (n < N) ? __int_as_float((int)Wref[n] << 23) : 0.f;
+    // PTQ1 stores the weight as trit * round(d/D_row * 127), so the row factor carries
+    // a 1/127 the MXFP4 paths do not have. Everything else is identical.
+    const float q = PTQ1 ? (1.0f / 127.0f) : 1.0f;
+    rf[j] = (n < N) ? __int_as_float((int)Wref[n] << 23) * q : 0.f;
   }
   {
     __bf16 *__restrict__ Cb = C + (size_t)(m0 + wm * TM * 16) * N;
@@ -2163,6 +2280,44 @@ __global__ void radiance_gather_scales_mxfp6_kernel(const unsigned char * __rest
     if (tid == 0) Wref[n] = shmax[0];
 }
 
+// PTQ1_0 zero-copy: W aliases the checkpoint's 28-byte blocks, so there is no scale
+// plane to gather. Only Wref is needed: the row's largest fp16 exponent field, mapped to
+// the e8m0 convention the epilogue uses (rf = 2^(Wref[n]-127)). The staged weight is
+// round(d / 2^(Wref-127) * 127), so Wref is the row normaliser, not a lossless bound.
+// Measured on the real checkpoint a row's d spans at most ~2 binades below its max.
+__global__ void radiance_gather_scales_ptq1_kernel(const unsigned char * __restrict__ src,
+                                                   int N, int K, unsigned char * __restrict__ Wref) {
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int nb = K / 128;
+    const unsigned char * __restrict__ row = src + (size_t) n * nb * 28;
+    unsigned int lmax = 0;
+    for (int b = tid; b < nb; b += stride) {
+        const unsigned int h = (unsigned int) row[b * 28 + 26] | ((unsigned int) row[b * 28 + 27] << 8);
+        const unsigned int e = (h >> 10) & 0x1Fu;      // fp16 biased exponent field
+        if (e > lmax) lmax = e;
+    }
+    __shared__ unsigned int sh[256];
+    sh[tid] = lmax;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && sh[tid + off] > sh[tid]) sh[tid] = sh[tid + off];
+        __syncthreads();
+    }
+    // The row normaliser must be >= every d in the row, and a block with exponent e holds
+    // d in [2^e, 2^(e+1)). Taking the next binade above the row max keeps round(d/drow*127)
+    // inside [0,127] for every block; using e_max itself would push the largest block to
+    // 254 and clamp half its magnitude away. fp16 biased exponent -> unbiased e_max ->
+    // e8m0 biased (e_max + 1) + 127 == exp_field + 113.
+    if (tid == 0) Wref[n] = (unsigned char) (sh[0] + 113u);
+}
+
+void ggml_cuda_radiance_gather_scales_ptq1(const unsigned char * src, int N, int K,
+                                           unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_ptq1_kernel<<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+
 void ggml_cuda_radiance_gather_scales_mxfp6(const unsigned char * src, int N, int K,
                                             unsigned char * Wref, cudaStream_t stream) {
     const int nb = (int)(K / QK_MXFP6);
@@ -2187,6 +2342,7 @@ struct ggml_rad_act_buf {
 // widths, and on multi-GPU (tensor split) a K-keyed cache hands device 0's allocation to the
 // kernel running on device 1 -> illegal memory access. current device is set by the caller.
 static std::map<std::pair<int, int64_t>, ggml_rad_act_buf> ggml_rad_act_bufs;
+static std::map<std::pair<int, int64_t>, ggml_rad_act_buf> ggml_rad_act_bufs_i8;
 static ggml_rad_act_buf ggml_rad_act_get(int64_t M, int64_t K, cudaStream_t stream) {
     const int dev = ggml_cuda_get_device();
     auto key = std::make_pair(dev, K);
@@ -2216,6 +2372,145 @@ static ggml_rad_act_buf ggml_rad_act_get(int64_t M, int64_t K, cudaStream_t stre
     return it->second;
 }
 
+// int8 activation quantizer for the PTQ1_0 path. Same shape as quantize_tokens_fp8
+// (row-fingerprint memo, fragment-tiled output) but saturates to [-127,127] and stores
+// the scale as amax/127 so the epilogue's As[m] keeps the same meaning.
+//
+// The fingerprint is seeded differently from the fp8 kernel AND the buffer set is
+// separate, so an fp8-quantised row can never be mistaken for an int8 one.
+template <int NIT>
+__global__ void quantize_tokens_i8(const float * __restrict__ x, int64_t sx, int64_t K,
+                                   signed char * __restrict__ q, float * __restrict__ scale,
+                                   uint2 * __restrict__ row_hash) {
+    const int64_t row = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const float * xr = x + row * sx;
+    __shared__ uint2 h;
+    __shared__ int skip;
+    if (tid < 64) {
+        uint32_t h0 = 0x85ebca6bu, h1 = 0xc2b2ae35u;   // different seed than the fp8 kernel
+        for (int i = tid; i < 128; i += 64) {
+            const uint32_t b = __float_as_uint(xr[(int64_t)(i * 37) % K]);
+            h0 = (h0 ^ b) * 0x85ebca6bu; const uint32_t t1 = h1 ^ (b + 0x9e3779b9u + (h0 << 6) + (h0 >> 2)); h1 = ((t1 << 13) | (t1 >> 19)) * 0xc2b2ae35u;
+        }
+        h.x = h0; h.y = h1;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const uint2 old = row_hash[row];
+        skip = (old.x == h.x && old.y == h.y);
+    }
+    __syncthreads();
+    if (skip) {
+        return;
+    }
+    if (tid == 0) {
+        row_hash[row] = h;
+    }
+    float4 v[NIT > 0 ? NIT : 1];
+    float local = 0.0f;
+    if (NIT > 0) {
+#pragma unroll
+        for (int i = 0; i < NIT; ++i) {
+            const int64_t k = (int64_t)(tid + i * nthreads) * 4;
+            if (k < K) {
+                v[i] = *(const float4 *)(xr + k);
+                local = fmaxf(local, fmaxf(fmaxf(fabsf(v[i].x), fabsf(v[i].y)), fmaxf(fabsf(v[i].z), fabsf(v[i].w))));
+            }
+        }
+    } else {
+        for (int64_t k = tid * 4; k < K; k += (int64_t)nthreads * 4) {
+            const float4 t = *(const float4 *)(xr + k);
+            local = fmaxf(local, fmaxf(fmaxf(fabsf(t.x), fabsf(t.y)), fmaxf(fabsf(t.z), fabsf(t.w))));
+        }
+    }
+    __shared__ float sh[32];
+    for (int off = 16; off > 0; off >>= 1)
+        local = fmaxf(local, __shfl_xor(local, off));
+    if ((tid & 31) == 0) sh[tid >> 5] = local;
+    __syncthreads();
+    if (tid == 0) {
+        float amax = 0.0f;
+        for (int i = 0; i < nthreads / 32; ++i) amax = fmaxf(amax, sh[i]);
+        scale[row] = amax > 0.0f ? amax / 127.0f : 0.0f;
+    }
+    __syncthreads();
+    const float d = scale[row];
+    const float dinv = d > 0.0f ? 1.0f / d : 0.0f;
+    const int64_t Kt = K >> 4;
+    const int64_t frag_row = (row >> 4) * Kt;
+    const int lrow = (int) (row & 15);
+    // Four int8 at a time, same fragment-tiled position formula as the fp8 kernel.
+#define PTQ1_Q4(a, b, c, e_) do {                                                  \
+        const int qa = __float2int_rn((a) * dinv);                                 \
+        const int qb = __float2int_rn((b) * dinv);                                 \
+        const int qc = __float2int_rn((c) * dinv);                                 \
+        const int qe = __float2int_rn((e_) * dinv);                                \
+        const int ca = qa < -127 ? -127 : (qa > 127 ? 127 : qa);                   \
+        const int cb = qb < -127 ? -127 : (qb > 127 ? 127 : qb);                   \
+        const int cc = qc < -127 ? -127 : (qc > 127 ? 127 : qc);                   \
+        const int ce = qe < -127 ? -127 : (qe > 127 ? 127 : qe);                   \
+        *(uint32_t *) (q + pos) = (uint32_t)(ca & 0xFF) | ((uint32_t)(cb & 0xFF) << 8) \
+                                | ((uint32_t)(cc & 0xFF) << 16) | ((uint32_t)(ce & 0xFF) << 24); \
+    } while (0)
+    if (NIT > 0) {
+#pragma unroll
+        for (int i = 0; i < NIT; ++i) {
+            const int64_t k = (int64_t)(tid + i * nthreads) * 4;
+            if (k < K) {
+                const int64_t pos = (frag_row + (k >> 4)) * 256 + (lrow + 16 * ((int) ((k >> 3) & 1))) * 8 + (k & 7);
+                PTQ1_Q4(v[i].x, v[i].y, v[i].z, v[i].w);
+            }
+        }
+    } else {
+        for (int64_t k = tid * 4; k < K; k += (int64_t)nthreads * 4) {
+            const float4 t = *(const float4 *)(xr + k);
+            const int64_t pos = (frag_row + (k >> 4)) * 256 + (lrow + 16 * ((int) ((k >> 3) & 1))) * 8 + (k & 7);
+            PTQ1_Q4(t.x, t.y, t.z, t.w);
+        }
+    }
+#undef PTQ1_Q4
+}
+
+void ggml_cuda_radiance_quantize_tokens_i8(const float * x, int64_t sx, int64_t K, int64_t M,
+                                           signed char ** q, float ** scale, cudaStream_t stream) {
+    const int dev = ggml_cuda_get_device();
+    auto key = std::make_pair(dev, K);
+    auto it = ggml_rad_act_bufs_i8.find(key);
+    if (it == ggml_rad_act_bufs_i8.end() || it->second.M < M) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
+            *q = nullptr;
+            return;
+        }
+        if (it != ggml_rad_act_bufs_i8.end()) {
+            cudaFree(it->second.q);
+            cudaFree(it->second.scale);
+            cudaFree(it->second.hashes);
+            ggml_rad_act_bufs_i8.erase(it);
+        }
+        ggml_rad_act_buf b = {nullptr, nullptr, nullptr, 0, 0};
+        const int64_t Mcap = std::max<int64_t>(M, 4096);
+        cudaMalloc((void **) &b.q, (size_t) ((Mcap + 15) & ~15) * K);
+        cudaMalloc((void **) &b.scale, (size_t) Mcap * 4);
+        cudaMalloc((void **) &b.hashes, (size_t) Mcap * sizeof(uint2));
+        cudaMemsetAsync(b.hashes, 0xFF, (size_t) Mcap * sizeof(uint2), stream);
+        b.M = Mcap; b.K = K;
+        it = ggml_rad_act_bufs_i8.emplace(key, b).first;
+    }
+    ggml_rad_act_buf & b = it->second;
+    const dim3 grid(1, (unsigned) M);
+    constexpr int QNTH = 256, QNIT = 5;
+    if (K <= (int64_t) QNTH * 4 * QNIT) {
+        quantize_tokens_i8<QNIT><<<grid, QNTH, 0, stream>>>(x, sx, K, (signed char *) b.q, b.scale, b.hashes);
+    } else {
+        quantize_tokens_i8<0><<<grid, QNTH, 0, stream>>>(x, sx, K, (signed char *) b.q, b.scale, b.hashes);
+    }
+    *q = (signed char *) b.q;
+    *scale = b.scale;
+}
+
 void ggml_cuda_radiance_quantize_tokens(const float * x, int64_t sx, int64_t K, int64_t M,
                                         unsigned char ** q, float ** scale, cudaStream_t stream) {
     ggml_rad_act_buf b = ggml_rad_act_get(M, K, stream);
@@ -2235,7 +2530,7 @@ void ggml_cuda_radiance_quantize_tokens(const float * x, int64_t sx, int64_t K, 
 
 static void launch_at_f32(uintptr_t at, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
                           uintptr_t cf, int M, int N, int K, uintptr_t stream, bool radsc,
-                          bool e6pack = false) {
+                          bool e6pack = false, bool ptq1 = false) {
     // TN=4 uses a 8x1 wave tile: 512 wide in M, 64 wide in N. This trades A rereads for W
     // rereads, which pays here because A is small and stays in cache while W streams from
     // DRAM: at M=2048/N=6144/K=5120 the A stream grows 503 -> 1007 MB (still well inside the
@@ -2251,23 +2546,23 @@ static void launch_at_f32(uintptr_t at, uintptr_t w, uintptr_t ws, uintptr_t wre
     dim3 fblock(NTHREADS);
     if (M >= 2048 && N >= B4_) {
         dim3 fgrid((N + B4_ - 1) / B4_, (M + BMF4_ - 1) / BMF4_);
-#define RAD_LAUNCH_AT4(RS_, E6P_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, (E6P_ ? 64 : 128), false, true, RS_, E6P_, TWM4, TWN4>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
-        if (e6pack) RAD_LAUNCH_AT4(false, true); else if (radsc) RAD_LAUNCH_AT4(true, false); else RAD_LAUNCH_AT4(false, false);
+#define RAD_LAUNCH_AT4(RS_, E6P_, P1_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, (E6P_ ? 64 : 128), false, true, RS_, E6P_, TWM4, TWN4, P1_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
+        if (ptq1) RAD_LAUNCH_AT4(false, false, true); else if (e6pack) RAD_LAUNCH_AT4(false, true, false); else if (radsc) RAD_LAUNCH_AT4(true, false, false); else RAD_LAUNCH_AT4(false, false, false);
 #undef RAD_LAUNCH_AT4
     } else {
         constexpr int B_ = BNF_OF(2);
         dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);
-#define RAD_LAUNCH_AT2(RS_, E6P_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<2, false, 128, false, true, RS_, E6P_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
-        if (e6pack) RAD_LAUNCH_AT2(false, true); else if (radsc) RAD_LAUNCH_AT2(true, false); else RAD_LAUNCH_AT2(false, false);
+#define RAD_LAUNCH_AT2(RS_, E6P_, P1_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<2, false, 128, false, true, RS_, E6P_, WM, WN, P1_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
+        if (ptq1) RAD_LAUNCH_AT2(false, false, true); else if (e6pack) RAD_LAUNCH_AT2(false, true, false); else if (radsc) RAD_LAUNCH_AT2(true, false, false); else RAD_LAUNCH_AT2(false, false, false);
 #undef RAD_LAUNCH_AT2
     }
 }
 
 void ggml_cuda_radiance_gemm_f32(const void * a_q, const void * w, const void * ws, const void * wref,
                                  const float * as, float * c, int M, int N, int K, cudaStream_t stream,
-                                 bool radsc, bool e6pack) {
+                                 bool radsc, bool e6pack, bool ptq1) {
     launch_at_f32((uintptr_t) a_q, (uintptr_t) w, (uintptr_t) ws, (uintptr_t) wref,
-                  (uintptr_t) as, (uintptr_t) c, M, N, K, (uintptr_t) stream, radsc, e6pack);
+                  (uintptr_t) as, (uintptr_t) c, M, N, K, (uintptr_t) stream, radsc, e6pack, ptq1);
 }
 
 bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t ne01,
@@ -2284,7 +2579,11 @@ bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t 
     // also drop MXFP4, so the two effects could not be told apart).
     const bool mxfp6_ok = type != GGML_TYPE_MXFP6 || getenv("GGML_RAD_MXFP6_DISABLE") == nullptr;
     const bool type_ok = (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_MXFP4_RAD || type == GGML_TYPE_MXFP6) && mxfp6_ok;
-    return amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && type_ok &&
+    // PTQ1_0 rides the same WMMA shape with an int8 datapath: its trits become row-
+    // normalised int8 weights and the activations are int8. Needs K % 128 == 0 because
+    // one 128-element block is the unit of both the trit packing and the scale.
+    const bool ptq1_ok = type == GGML_TYPE_PTQ1_0 && ne00 % 128 == 0;
+    return amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && (type_ok || ptq1_ok) &&
         ne11 >= min_m && ne00 % 64 == 0 && ne10 == ne00 && (ne01 % 16 == 0) && contiguous_dst;
 }
 

@@ -246,6 +246,17 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
             CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
             ggml_cuda_radiance_gather_scales_mxfp6((const unsigned char *) src0->data, N, K,
                                                    (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_PTQ1_0) {
+            // PTQ1_0 zero-copy: the atiled PTQ1 staging reads the checkpoint's 28-byte
+            // blocks in place and normalises each block's fp16 d against the row max, so
+            // W aliases the weight buffer and there is no scale plane. Only Wref (the row
+            // max exponent, one byte per row) is materialised.
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales_ptq1((const unsigned char *) src0->data, (int) N, (int) K,
+                                                  (unsigned char *) w.Wref, stream);
         } else if (src0->type == GGML_TYPE_MXFP4_RAD) {
             w.own_w = false;   // W aliases the weight buffer (full-plane rad2 layout)
             // zero-copy: the atiled RADSC path reads the row-major scale plane straight from
@@ -267,9 +278,22 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
     const ggml_radiance_weight & w = it->second;
 
     // activation fp8: prefer the q the fused GLU already produced; else quantize from f32
+    const bool ptq1 = src0->type == GGML_TYPE_PTQ1_0;
     unsigned char * q8 = nullptr;
     float * as = nullptr;
-    if (!ggml_rad_fused_act_lookup(src1->data, K, (const unsigned char **) &q8, (const float **) &as)) {
+    // PTQ1_0 needs int8 activations, so it must not consume the e4m3 buffer the fused
+    // producers (add_rms/swiglu) register, nor the fp8 quantizer's row-fingerprint memo.
+    if (!ptq1 && ggml_rad_fused_act_lookup(src1->data, K, (const unsigned char **) &q8, (const float **) &as)) {
+        // reuse the fused producer's e4m3
+    } else if (ptq1) {
+        signed char * q8s = nullptr;
+        ggml_cuda_radiance_quantize_tokens_i8((const float *) src1->data, src1->nb[1] / sizeof(float),
+                                              K, M, &q8s, &as, stream);
+        if (q8s == nullptr) {
+            return false;   // act scratch realloc declined under capture, fall back to MMQ
+        }
+        q8 = (unsigned char *) q8s;
+    } else {
         ggml_cuda_radiance_quantize_tokens((const float *) src1->data, src1->nb[1] / sizeof(float),
                                            K, M, &q8, &as, stream);
         if (q8 == nullptr) {
@@ -279,7 +303,7 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
 
     ggml_cuda_radiance_gemm_f32(q8, w.W, w.Ws, w.Wref, as,
                                 (float *) dst->data, (int) M, (int) N, (int) K, stream,
-                                src0->type == GGML_TYPE_MXFP4_RAD, w.e6pack);
+                                src0->type == GGML_TYPE_MXFP4_RAD, w.e6pack, ptq1);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
