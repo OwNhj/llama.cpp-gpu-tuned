@@ -155,6 +155,17 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
+    int ret = std::min(ne11, int64_t(512));
+    ret -= ret % 8;
+    for (;ret > 0; ret -= 8) {
+        if (ggml_cuda_mmq_get_config(type, ret, fallback, cc, GGML_PREC_Q8).type != GGML_TYPE_COUNT) {
+            return ret;
+        }
+    }
+    return ret;
+}
+
 static size_t ggml_cuda_mmq_q8_buffer_size(
         ggml_type type, bool fallback, int cc,
         int64_t ne10_padded, int64_t ne11, int64_t ne12, int64_t ne13);
@@ -429,9 +440,8 @@ void ggml_cuda_mul_mat_q(
 static size_t ggml_cuda_mmq_q8_buffer_size(
         ggml_type type, bool fallback, int cc,
         int64_t ne10_padded, int64_t ne11, int64_t ne12, int64_t ne13) {
-    // A tile can read up to J-1 extra columns; 128 is the largest tile width.
-    (void) type; (void) fallback; (void) cc; (void) ne11;
-    return ne13*ne12*ne11*ne10_padded*sizeof(block_q8_1_mmq)/QK8_1_MMQ + 128*sizeof(block_q8_1_mmq);
+    return ne13*ne12*ne11*ne10_padded*sizeof(block_q8_1_mmq)/QK8_1_MMQ +
+        ggml_cuda_mmq_get_J_max(type, fallback, cc, ne11)*sizeof(block_q8_1_mmq);
 }
 
 size_t ggml_cuda_mul_mat_q_q8_size(const ggml_tensor * src0, const ggml_tensor * src1) {
