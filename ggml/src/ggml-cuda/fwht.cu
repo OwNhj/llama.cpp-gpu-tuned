@@ -250,8 +250,10 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
 #undef FWHT_SMEM_CASE
 #undef FWHT_BLOCK_CASE
         default:
-            return false;
+            break;
     }
+
+    return false;
 }
 
 static bool fwht_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst,
