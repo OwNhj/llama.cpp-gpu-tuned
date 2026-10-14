@@ -240,8 +240,14 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
         w.device = device;
         const size_t wq_bytes  = (size_t)N * K / 2;
         const size_t ws_bytes  = (size_t)N * (K / 32);
-        // PTQ1_0 keeps the row normaliser as fp16; every other type uses one e8m0 byte.
-        const size_t wref_bytes = src0->type == GGML_TYPE_PTQ1_0 ? (size_t) 2 * N : (size_t) N;
+        // PTQ1_0 and IQ1_S keep the row normaliser as fp16; every other type uses one e8m0 byte.
+        const size_t wref_bytes = (src0->type == GGML_TYPE_PTQ1_0 || src0->type == GGML_TYPE_IQ1_S ||
+                                   src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S ||
+                                   src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ2_XXS ||
+                                   src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ2_S ||
+                                   src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K ||
+                                   src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_IQ1_M)
+                                ? (size_t) 2 * N : (size_t) N;
         if (src0->type == GGML_TYPE_MXFP6) {
             // MXFP6 zero-copy: the atiled E6PACK path reads the checkpoint's packed 6-bit bytes
             // in place and folds them to e4m3, so W aliases the weight buffer and there is no
@@ -265,6 +271,96 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
             CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
             ggml_cuda_radiance_gather_scales_ptq1((const unsigned char *) src0->data, (int) N, (int) K,
                                                   (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_IQ1_S) {
+            // IQ1_S zero-copy: the atiled IQ1S staging reads the checkpoint's 50-byte blocks
+            // in place (codebook index + per-sub-block dl/delta), so W aliases the weight
+            // buffer and no scale plane exists. Only Wref (row max of dl, fp16) is built.
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales_iq1s((const unsigned char *) src0->data, (int) N, (int) K,
+                                                  (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_IQ4_XS) {
+            // IQ4_XS zero-copy: the atiled IQ4XS staging reads the checkpoint's 136-byte
+            // blocks in place (codebook nibbles + per-sub-block signed scale), so W aliases
+            // the weight buffer and no scale plane exists. Only Wref is built.
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales_iq4xs((const unsigned char *) src0->data, (int) N, (int) K,
+                                                   (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_IQ3_S) {
+            // IQ3_S zero-copy: the atiled IQ3S staging reads the checkpoint's 110-byte
+            // blocks in place (grid index + per-sub-block scale + sign bytes), so W aliases
+            // the weight buffer. Only Wref (row normaliser, fp16) is materialised.
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales_iq3s((const unsigned char *) src0->data, (int) N, (int) K,
+                                                  (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_IQ3_XXS) {
+            // IQ3_XXS zero-copy: the atiled IQ3XXS staging reads the checkpoint's 98-byte
+            // blocks in place. Wref must be the true row max (the gather decodes the grid).
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales_iq3xxs((const unsigned char *) src0->data, (int) N, (int) K,
+                                                    (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS ||
+                   src0->type == GGML_TYPE_IQ2_S) {
+            // IQ2 family zero-copy: 66/74/82-byte blocks read in place. Wref is the true row
+            // max, so the gather decodes the grid.
+            const int which3 = src0->type == GGML_TYPE_IQ2_XXS ? 0
+                             : (src0->type == GGML_TYPE_IQ2_XS ? 1 : 2);
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            if (which3 == 0) {
+                ggml_cuda_radiance_gather_scales_iq2xxs((const unsigned char *) src0->data, (int) N, (int) K,
+                                                        (unsigned char *) w.Wref, stream);
+            } else if (which3 == 1) {
+                ggml_cuda_radiance_gather_scales_iq2xs((const unsigned char *) src0->data, (int) N, (int) K,
+                                                       (unsigned char *) w.Wref, stream);
+            } else {
+                ggml_cuda_radiance_gather_scales_iq2s((const unsigned char *) src0->data, (int) N, (int) K,
+                                                      (unsigned char *) w.Wref, stream);
+            }
+        } else if (src0->type == GGML_TYPE_Q4_K) {
+            // Q4_K zero-copy: the atiled Q4K staging reads the checkpoint's 144-byte
+            // blocks in place. Wref is the true row max, computed from the group extremes.
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales_q4k((const unsigned char *) src0->data, (int) N, (int) K,
+                                                 (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q2_K) {
+            // Q6_K / Q2_K zero-copy: 210 / 84-byte blocks read in place.
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            if (src0->type == GGML_TYPE_Q6_K) {
+                ggml_cuda_radiance_gather_scales_q6k((const unsigned char *) src0->data, (int) N, (int) K,
+                                                     (unsigned char *) w.Wref, stream);
+            } else {
+                ggml_cuda_radiance_gather_scales_q2k((const unsigned char *) src0->data, (int) N, (int) K,
+                                                     (unsigned char *) w.Wref, stream);
+            }
+        } else if (src0->type == GGML_TYPE_IQ1_M) {
+            // IQ1_M zero-copy: the atiled IQ1M staging reads the checkpoint's 56-byte
+            // blocks in place. Wref is 1.125*max(dl) over the row, from the scale fields.
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales_iq1m((const unsigned char *) src0->data, (int) N, (int) K,
+                                                  (unsigned char *) w.Wref, stream);
         } else if (src0->type == GGML_TYPE_MXFP4_RAD) {
             w.own_w = false;   // W aliases the weight buffer (full-plane rad2 layout)
             // zero-copy: the atiled RADSC path reads the row-major scale plane straight from
@@ -287,17 +383,31 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
 
     // activation fp8: prefer the q the fused GLU already produced; else quantize from f32
     const bool ptq1 = src0->type == GGML_TYPE_PTQ1_0;
+    const bool iq1s = src0->type == GGML_TYPE_IQ1_S;
+    const bool iq4xs = src0->type == GGML_TYPE_IQ4_XS;
+    const bool iq3s = src0->type == GGML_TYPE_IQ3_S;
+    const bool iq3xxs = src0->type == GGML_TYPE_IQ3_XXS;
+    const bool iq2xxs = src0->type == GGML_TYPE_IQ2_XXS;
+    const bool iq2xs  = src0->type == GGML_TYPE_IQ2_XS;
+    const bool iq2s   = src0->type == GGML_TYPE_IQ2_S;
+    const bool q4k    = src0->type == GGML_TYPE_Q4_K;
+    const bool q6k    = src0->type == GGML_TYPE_Q6_K;
+    const bool q2k    = src0->type == GGML_TYPE_Q2_K;
+    const bool iq1m   = src0->type == GGML_TYPE_IQ1_M;
     unsigned char * q8 = nullptr;
     float * as = nullptr;
-    // PTQ1_0 needs int8 activations, so it must not consume the e4m3 buffer the fused
-    // producers (add_rms/swiglu) register, nor the fp8 quantizer's row-fingerprint memo.
-    if (!ptq1 && ggml_rad_fused_act_lookup(src1->data, K, (const unsigned char **) &q8, (const float **) &as)) {
+    // PTQ1_0 and IQ1_S need int8 activations, so they must not consume the e4m3 buffer the
+    // fused producers (add_rms/swiglu) register, nor the fp8 quantizer's row-fingerprint memo.
+    if (!ptq1 && !iq1s && !iq4xs && !iq3s && ggml_rad_fused_act_lookup(src1->data, K, (const unsigned char **) &q8, (const float **) &as)) {
         // reuse the fused producer's e4m3
-    } else if (ptq1) {
+    } else if (ptq1 || iq1s || iq4xs || iq3s || iq3xxs || iq2xxs || iq2xs || iq2s || q4k || q6k || q2k || iq1m) {
         signed char * q8s = nullptr;
         // A fused Hadamard producer may already have written this activation's int8 codes and row
-        // scales; only PTQ1_0 activations ever land in that registry (see ggml_cuda_try_fwht_quant_i8).
-        if (!ggml_rad_fwht_i8_act_lookup(dst->data, K, M, &q8s, &as)) {
+        // scales; only PTQ1_0 activations land in that registry (see ggml_cuda_try_fwht_quant_i8),
+        // so IQ1_S always quantizes here.
+        if (ptq1 && ggml_rad_fwht_i8_act_lookup(dst->data, K, M, &q8s, &as)) {
+            // reuse the fused Hadamard producer's int8 codes
+        } else {
             ggml_cuda_radiance_quantize_tokens_i8((const float *) src1->data, src1->nb[1] / sizeof(float),
                                                   K, M, &q8s, &as, stream);
             if (q8s == nullptr) {
@@ -315,7 +425,8 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
 
     ggml_cuda_radiance_gemm_f32(q8, w.W, w.Ws, w.Wref, as,
                                 (float *) dst->data, (int) M, (int) N, (int) K, stream,
-                                src0->type == GGML_TYPE_MXFP4_RAD, w.e6pack, ptq1);
+                                src0->type == GGML_TYPE_MXFP4_RAD, w.e6pack, ptq1, iq1s, iq4xs, iq3s, iq3xxs,
+                                iq2xxs, iq2xs, iq2s, q4k, q6k, q2k, iq1m);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

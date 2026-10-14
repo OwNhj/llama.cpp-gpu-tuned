@@ -28,10 +28,64 @@ void ggml_cuda_radiance_quantize_tokens_i8(const float * x, int64_t sx, int64_t 
 
 void ggml_cuda_radiance_gemm_f32(const void * a_q, const void * w, const void * ws, const void * wref,
                                  const float * as, float * c, int M, int N, int K, cudaStream_t stream,
-                                 bool radsc = false, bool e6pack = false, bool ptq1 = false);
+                                 bool radsc = false, bool e6pack = false, bool ptq1 = false, bool iq1s = false,
+                                 bool iq4xs = false, bool iq3s = false, bool iq3xxs = false,
+                                 bool iq2xxs = false, bool iq2xs = false, bool iq2s = false,
+                                 bool q4k = false, bool q6k = false, bool q2k = false,
+                                 bool iq1m = false);
+
+// row normaliser for IQ1_M: D_row = 1.125 * max(dl) over the row, as fp16.
+void ggml_cuda_radiance_gather_scales_iq1m(const unsigned char * src, int N, int K,
+                                           unsigned char * Wref, cudaStream_t stream);
+
+// row normalisers for Q6_K and Q2_K: D_row = max|w| over the row, as fp16.
+void ggml_cuda_radiance_gather_scales_q6k(const unsigned char * src, int N, int K,
+                                          unsigned char * Wref, cudaStream_t stream);
+void ggml_cuda_radiance_gather_scales_q2k(const unsigned char * src, int N, int K,
+                                          unsigned char * Wref, cudaStream_t stream);
+
+// row normaliser for Q4_K: D_row = max|w| over the row, as fp16.
+void ggml_cuda_radiance_gather_scales_q4k(const unsigned char * src, int N, int K,
+                                          unsigned char * Wref, cudaStream_t stream);
+
+// row normalisers for the IQ2 family: D_row = max|w| over the row, as fp16.
+void ggml_cuda_radiance_gather_scales_iq2xxs(const unsigned char * src, int N, int K,
+                                             unsigned char * Wref, cudaStream_t stream);
+void ggml_cuda_radiance_gather_scales_iq2xs(const unsigned char * src, int N, int K,
+                                            unsigned char * Wref, cudaStream_t stream);
+void ggml_cuda_radiance_gather_scales_iq2s(const unsigned char * src, int N, int K,
+                                           unsigned char * Wref, cudaStream_t stream);
+
+// row normaliser for IQ3_XXS: D_row = max|w| over the row, as fp16.
+void ggml_cuda_radiance_gather_scales_iq3xxs(const unsigned char * src, int N, int K,
+                                             unsigned char * Wref, cudaStream_t stream);
+
+// row normaliser for IQ3_S: D_row = 15 * max over the row of |db|, as fp16.
+void ggml_cuda_radiance_gather_scales_iq3s(const unsigned char * src, int N, int K,
+                                           unsigned char * Wref, cudaStream_t stream);
+
+// row normaliser for IQ4_XS: D_row = 127 * max over the row of |dl|, as fp16.
+void ggml_cuda_radiance_gather_scales_iq4xs(const unsigned char * src, int N, int K,
+                                            unsigned char * Wref, cudaStream_t stream);
+
+// row normaliser for IQ1_S: D_row = 1.125 * max over the row of dl, as fp16.
+void ggml_cuda_radiance_gather_scales_iq1s(const unsigned char * src, int N, int K,
+                                           unsigned char * Wref, cudaStream_t stream);
 
 bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t ne01,
                                   int64_t ne11, int64_t ne10, bool contiguous_dst);
+
+// Weight types whose radiance path stages int8 codes and therefore needs int8 activations
+// (signed char + per-row float scale). Anything not listed here uses the e4m3 datapath.
+// Keep this the single source of truth: the fused producers use it to decide whether the
+// e4m3 buffer they would write can be consumed at all.
+static inline bool ggml_cuda_radiance_is_int8_type(ggml_type type) {
+    return type == GGML_TYPE_PTQ1_0 || type == GGML_TYPE_IQ1_S || type == GGML_TYPE_IQ4_XS ||
+           type == GGML_TYPE_IQ3_S  || type == GGML_TYPE_IQ3_XXS ||
+           type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
+           type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q2_K ||
+           type == GGML_TYPE_IQ1_M;
+}
 
 // fused GLU fast path (B1): produce down-GEMM fp8 alongside y. lookup/registry span one graph.
 bool ggml_cuda_try_swiglu_quant_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);

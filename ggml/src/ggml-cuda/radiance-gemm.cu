@@ -724,8 +724,39 @@ static __device__ __forceinline__ unsigned int ptq1_0_i8_mag(unsigned int h, uns
     return (unsigned int) q;
 }
 
+// 16-entry int8 table lookup, four entries per v_perm. Same form as vecdotq.cuh.
+// Same 16-entry table, but the four selectors arrive one per BYTE (each 0..15) instead
+// of nibble-packed. IQ3_S needs this: it looks up a 512-entry grid first, and the grid
+// entry holds four 4-bit values that then index the per-sub-block table.
+static __device__ __forceinline__ unsigned int radiance_lut16_from_bytes(unsigned int g,
+                                                                        const unsigned int * __restrict__ t) {
+    const unsigned int idx = g & 0x0F0F0F0Fu;
+    const unsigned int lo = __builtin_amdgcn_perm(t[1], t[0], idx & 0x07070707u);
+    const unsigned int hi = __builtin_amdgcn_perm(t[3], t[2], idx & 0x07070707u);
+    const unsigned int m = 0x03020100u | ((idx & 0x08080808u) >> 1);
+    return __builtin_amdgcn_perm(hi, lo, m);
+}
+
+// Shared by IQ4_XS: indexes its per-sub-block table with a 4-bit code.
+static __device__ __forceinline__ int2 radiance_lut16_i8(unsigned int q, const unsigned int * __restrict__ t) {
+    const unsigned int qe = q & 0x0F0F0F0Fu;
+    const unsigned int qo = (q >> 4) & 0x0F0F0F0Fu;
+    const unsigned int lo_e = __builtin_amdgcn_perm(t[1], t[0], qe & 0x07070707u);
+    const unsigned int lo_o = __builtin_amdgcn_perm(t[1], t[0], qo & 0x07070707u);
+    const unsigned int hi_e = __builtin_amdgcn_perm(t[3], t[2], qe & 0x07070707u);
+    const unsigned int hi_o = __builtin_amdgcn_perm(t[3], t[2], qo & 0x07070707u);
+    const unsigned int me = 0x03020100u | ((qe & 0x08080808u) >> 1);
+    const unsigned int mo = 0x03020100u | ((qo & 0x08080808u) >> 1);
+    int2 r;
+    r.x = (int) __builtin_amdgcn_perm(hi_e, lo_e, me);
+    r.y = (int) __builtin_amdgcn_perm(hi_o, lo_o, mo);
+    return r;
+}
+
 template <int TN, bool WPERM, int LBK = BK, bool E6 = false, bool F32OUT = false, bool RADSC = false,
-          bool E6PACK = false, int TWM = WM, int TWN = WN, bool PTQ1 = false>
+          bool E6PACK = false, int TWM = WM, int TWN = WN, bool PTQ1 = false, bool IQ1S = false, bool IQ4XS = false, bool IQ3S = false, bool IQ3XXS = false,
+          bool IQ2XXS = false, bool IQ2XS = false, bool IQ2S = false, bool Q4K = false,
+          bool Q6K = false, bool Q2K = false, bool IQ1M = false>
 __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled(
     const unsigned char *__restrict__ AT, const unsigned char *__restrict__ W,
     const unsigned char *__restrict__ Ws, const unsigned char *__restrict__ Wref,
@@ -819,13 +850,16 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
       wcol[it] = (g % (LBK / 16)) * 16;
       wrc[it] = wrow[it] < N - 1 - n0 ? wrow[it] : N - 1 - n0;
       wkst[it] = 0; wlanec[it] = 0;
-    } else if constexpr (PTQ1) {
+    } else if constexpr (PTQ1 || IQ1S || IQ4XS || IQ3S || IQ3XXS || IQ2XXS || IQ2XS || IQ2S || Q4K || Q6K || Q2K || IQ1M) {
       // PTQ1_0 decodes one 16-element group per slot, and the group picks which of the
       // block's byte ranges the decode reads. Letting the packed byte column vary with the
       // lane put all eight groups in one warp, so the three decode ranges ran one after
       // another with a fraction of the lanes active. Give the group to the slot index
       // instead: a 64-thread run then shares one group, so no warp diverges. The slot
       // order is unchanged, only which thread handles which slot.
+      //
+      // IQ1_S reuses the same assignment: its block is 256 wide, so two 128-wide slabs
+      // cover it and each slot still handles exactly one 16-element group.
       const int slot = it * NTHREADS_T + tid;
       wrow[it] = slot % BNF_T;
       wcol[it] = (slot / BNF_T) * 8;
@@ -844,6 +878,9 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
   for (int it = 0; it < NW; ++it) {
     if constexpr (PTQ1) {
       // M comes from sM8, built once per tile row; nothing per-slot is needed.
+    } else if constexpr (IQ1S || IQ4XS || IQ3S || IQ3XXS || IQ2XXS || IQ2XS || IQ2S || Q4K || Q6K || Q2K || IQ1M) {
+      // D_row is fp16 and is read directly by the staging branch (Wref + 2*gsrc).
+      // The default branch below would read a single byte, which is wrong for a half.
     } else if constexpr (WPERM) {
       if constexpr (WSLOTS == 4) wref[it] = *(const unsigned int *)(Wref + wrc[it]);
       else                       wref[it] = *(const unsigned short *)(Wref + wrc[it]);
@@ -859,10 +896,23 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
     const int rr = n0 + lr < N ? n0 + lr : N - 1;
     const float drow = ptq1_h2f(*(const unsigned short *) (Wref + 2 * rr));
     rc_bits = __float_as_uint(drow > 0.0f ? 127.0f / drow : 0.0f);
+  } else if constexpr (IQ1S || IQ1M) {
+    // IQ1_S / IQ1_M keep the row normaliser as fp16 (the row max of dl) and stage the
+    // scale in eighths, so the reciprocal is 8*127/D_row.
+    const int lr = tid % BNF_T;
+    const int rr = n0 + lr < N ? n0 + lr : N - 1;
+    const float drow = ptq1_h2f(*(const unsigned short *) (Wref + 2 * rr));
+    rc_bits = __float_as_uint(drow > 0.0f ? 1016.0f / drow : 0.0f);   // 8*127
+  } else if constexpr (IQ4XS || IQ3S || IQ3XXS || IQ2XXS || IQ2XS || IQ2S || Q4K || Q6K || Q2K) {
+    // F/Pf = round(256*127*|scale|/D_row), so the reciprocal is 256*127/D_row = 32512/D_row.
+    const int lr = tid % BNF_T;
+    const int rr = n0 + lr < N ? n0 + lr : N - 1;
+    const float drow = ptq1_h2f(*(const unsigned short *) (Wref + 2 * rr));
+    rc_bits = __float_as_uint(drow > 0.0f ? 32512.0f / drow : 0.0f);
   }
 
   // PTQ1 accumulates in int32 (the i8 WMMA's native form); every other path in float.
-  using acc_t = typename std::conditional<PTQ1, int32x8_t, floatx8>::type;
+  using acc_t = typename std::conditional<PTQ1 || IQ1S || IQ4XS || IQ3S || IQ3XXS || IQ2XXS || IQ2XS || IQ2S || Q4K || Q6K || Q2K || IQ1M, int32x8_t, floatx8>::type;
   acc_t acc[TM][TN];
 #pragma unroll
   for (int i = 0; i < TM; ++i)
@@ -952,6 +1002,10 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
         ptq1_0_decode16_lazy(bw, (wcol[it] * 2) & ~15, M, tr);
         *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = uint4_t{tr[0], tr[1], tr[2], tr[3]};
       }
+    } else if constexpr (IQ1S || IQ4XS || IQ3S || IQ3XXS || IQ2XXS || IQ2XS || IQ2S || Q4K || Q6K || Q2K || IQ1M) {
+      // No global load here: Ws is null for these zero-copy types and the staging in the
+      // second chain reads the packed blocks straight from W. This arm only keeps chain 1
+      // from running the MXFP4 loader, which would dereference that null scale plane.
     } else {
       const unsigned char *__restrict__ Wb = W + (size_t)__builtin_amdgcn_readfirstlane((int)(((size_t)n0 * K + k0) / 2));
       if constexpr (RADSC) {
@@ -1023,6 +1077,537 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
       }
     } else if constexpr (PTQ1) {
       // Already int8 in the staging branch above (trit * row-normalised magnitude).
+    } else if constexpr (Q4K) {
+      // Q4_K zero-copy: 144-byte blocks read in place. LBK == 128 covers half of a
+      // 256-element block. A slot stages 16 elements which always sit inside one
+      // 32-element group, so the group's (S, M) apply unchanged.
+      const int kblk = k0 / 256;
+      const int nbk  = K / 256;
+      const int half = (k0 % 256) / 128;
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        const unsigned char *__restrict__ blk =
+            W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * 144;
+        const unsigned int dlo = (unsigned int) blk[0] | ((unsigned int) blk[1] << 8);
+        const unsigned int dmo = (unsigned int) blk[2] | ((unsigned int) blk[3] << 8);
+        const float d    = __half2float(*(const ggml_half *) &dlo);
+        const float dmin = __half2float(*(const ggml_half *) &dmo);
+
+        const int eoff = half * 128 + ((wcol[it] * 2) & 127);   // element base in the block
+        const int g    = eoff / 32;                             // 32-element group 0..7
+        const int chunk = g >> 1;                               // 64-element chunk 0..3
+        const int hi    = g & 1;                                // low or high nibble
+        const int w16   = eoff % 32;                            // 0 or 16
+
+        // get_scale_min_k4(g, scales) for the 12-byte packed table
+        const unsigned char *__restrict__ sc12 = blk + 4;
+        const int j = g;
+        int scv, mv;
+        if (j < 4) {
+          scv = (int) (sc12[j] & 63u);
+          mv  = (int) (sc12[j + 4] & 63u);
+        } else {
+          scv = (int) (sc12[j + 4] & 0xFu) | (((int) (sc12[j - 4]) >> 6) << 4);
+          mv  = (int) (sc12[j + 4] >> 4)   | (((int) (sc12[j])     >> 6) << 4);
+        }
+        const float S = d * (float) scv;
+        const float M = dmin * (float) mv;
+        const int F = (int) rintf(S * __uint_as_float(rc_bits));
+        const int C = (int) rintf(M * __uint_as_float(rc_bits));
+
+        // Both groups of a chunk read the SAME 32 qs bytes (the library does q += 32 per
+        // 64-element chunk); only the nibble differs. A slot covers w16 in {0,16}, so the
+        // byte offset inside the chunk is w16 -- NOT hi*16, which read the wrong row for
+        // 6 of the 8 group/half combinations.
+        const unsigned char *__restrict__ qp = blk + 16 + chunk * 32 + w16;
+        uint4_t out;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          unsigned int w0 = 0, w1 = 0;
+#pragma unroll
+          for (int jj = 0; jj < 4; ++jj) {
+            const unsigned char raw0 = qp[r * 8 + jj];
+            const unsigned char raw1 = qp[r * 8 + jj + 4];
+            const int q0 = hi ? (raw0 >> 4) : (raw0 & 0xF);
+            const int q1 = hi ? (raw1 >> 4) : (raw1 & 0xF);
+            int c0 = (F * q0 - C + 128) >> 8;
+            int c1 = (F * q1 - C + 128) >> 8;
+            c0 = c0 < -127 ? -127 : (c0 > 127 ? 127 : c0);
+            c1 = c1 < -127 ? -127 : (c1 > 127 ? 127 : c1);
+            w0 |= ((unsigned int) (c0 & 0xFF)) << (8 * jj);
+            w1 |= ((unsigned int) (c1 & 0xFF)) << (8 * jj);
+          }
+          out[2 * r]     = w0;
+          out[2 * r + 1] = w1;
+        }
+        *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = out;
+      }
+    } else if constexpr (IQ1M) {
+      // IQ1_M zero-copy: 56-byte blocks read in place. LBK == 128 covers half a block, so
+      // k0/256 selects the block and k0%256 the half. A slot stages 16 elements = grid rows
+      // {l0, l0+1} of one 32-element sub-block: one dl, but a delta per row, so this needs
+      // two wtabs where IQ1_S needs one.
+      const int kblk = k0 / 256;
+      const int nbk  = K / 256;
+      const int half = (k0 % 256) / 128;
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        const unsigned char *__restrict__ blk =
+            W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * 56;
+
+        // d is not a plain half at offset 0: it is assembled from the top nibble of each
+        // of the four uint16 the 8 scale bytes form.
+        const unsigned int s0 = (unsigned int) blk[48] | ((unsigned int) blk[49] << 8);
+        const unsigned int s1 = (unsigned int) blk[50] | ((unsigned int) blk[51] << 8);
+        const unsigned int s2 = (unsigned int) blk[52] | ((unsigned int) blk[53] << 8);
+        const unsigned int s3 = (unsigned int) blk[54] | ((unsigned int) blk[55] << 8);
+        const unsigned int dh = ((s0 >> 12) | ((s1 >> 8) & 0x00F0u) |
+                                 ((s2 >> 4) & 0x0F00u) | (s3 & 0xF000u)) & 0xFFFFu;
+        const float d = __half2float(*(const ggml_half *) &dh);
+
+        const int eoff = half * 128 + ((wcol[it] * 2) & 127);
+        const int sub  = eoff / 32;                             // 32-element sub-block 0..7
+        const int l0   = ((eoff % 32) / 16) * 2;                // first grid row: 0 or 2
+
+        const unsigned int sc16 = (sub / 2 == 0 ? s0 : (sub / 2 == 1 ? s1 : (sub / 2 == 2 ? s2 : s3)));
+        const int sh = 6 * (sub % 2);
+        // rows 0,1 take dl1; rows 2,3 take dl2 -- a slot always sits inside one of them.
+        const float dl = d * (2.0f * (float) ((sc16 >> (sh + (l0 == 0 ? 0 : 3))) & 7u) + 1.0f);
+        int M8 = (int) rintf(dl * __uint_as_float(rc_bits));
+        if (M8 > 1016) M8 = 1016;
+
+        const int base = 8 * M8;
+        const unsigned int qh0 = (unsigned int) blk[32 + 2 * sub];
+        const unsigned int qh1 = (unsigned int) blk[33 + 2 * sub];
+
+        unsigned int out[4];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int l = l0 + h;
+          const unsigned int qhw = (l < 2) ? qh0 : qh1;
+          const unsigned int dbit = (l % 2 == 0) ? 0x08u : 0x80u;
+          const int dt = (qhw & dbit) ? -M8 : M8;
+          int v0 = (-base + dt + 32) >> 6;
+          int v1 = (        dt + 32) >> 6;
+          int v2 = ( base + dt + 32) >> 6;
+          v0 = v0 < -127 ? -127 : (v0 > 127 ? 127 : v0);
+          v1 = v1 < -127 ? -127 : (v1 > 127 ? 127 : v1);
+          v2 = v2 < -127 ? -127 : (v2 > 127 ? 127 : v2);
+          const unsigned int wtab = ((unsigned int) (v0 & 0xFF))
+                                  | ((unsigned int) (v1 & 0xFF) << 8)
+                                  | ((unsigned int) (v2 & 0xFF) << 16);
+          // Library: idx[0] = qs[0] | ((qh0 << 8) & 0x700) -> qh0 bits 0..2 at bits 8..10
+          //          idx[1] = qs[1] | ((qh0 << 4) & 0x700) -> qh0 bits 4..6 at bits 8..10
+          // so even l takes the low 3 bits and odd l the next 3.
+          const unsigned int qb = (l % 2 == 0) ? qhw : (qhw >> 4);
+          const unsigned int idx = (unsigned int) blk[4 * sub + l] | ((qb & 7u) << 8);
+          const unsigned int g8 = iq1s_grid_gpu[idx];
+          out[2 * h]     = __builtin_amdgcn_perm(wtab, wtab, g8 & 0x0F0F0F0Fu);
+          out[2 * h + 1] = __builtin_amdgcn_perm(wtab, wtab, (g8 >> 4) & 0x0F0F0F0Fu);
+        }
+        *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = uint4_t{out[0], out[1], out[2], out[3]};
+      }
+    } else if constexpr (Q6K) {
+      // Q6_K zero-copy: 210-byte blocks read in place. LBK == 128 equals one 128-element
+      // half, and a 16-element slot always lands inside one 32-element stream, so a single
+      // signed sc and one (ql offset, nibble, qh shift) triple cover the whole slot.
+      // Mapping verified against the library in kq_slot_map.py (rel err 1.2093%).
+      const int kblk = k0 / 256;
+      const int nbk  = K / 256;
+      const int o    = (k0 % 256) / 128;
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        const unsigned char *__restrict__ blk =
+            W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * 210;
+        const float d = __half2float(*(const ggml_half *) (blk + 208));
+
+        const int eoff   = o * 128 + ((wcol[it] * 2) & 127);
+        const int within = eoff % 128;
+        const int stream = within / 32;
+        const int l0     = within % 32;              // 0 or 16
+        const int sci    = o * 8 + l0 / 16 + 2 * stream;
+        const signed char scv = (signed char) blk[192 + sci];
+        const int G = (int) rintf(d * (float) scv * __uint_as_float(rc_bits));
+
+        const int ql_off = o * 64 + l0 + ((stream & 1) ? 32 : 0);
+        const int qh_off = 128 + o * 32 + l0;
+        const int nsh    = (stream >= 2) ? 4 : 0;
+        const int qsh    = 2 * stream;
+
+        uint4_t out;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          unsigned int w0 = 0, w1 = 0;
+#pragma unroll
+          for (int jj = 0; jj < 8; ++jj) {
+            const int qlv = (int) blk[ql_off + r * 8 + jj];
+            const int qhv = (int) blk[qh_off + r * 8 + jj];
+            const int u = (((qlv >> nsh) & 0xF) | (((qhv >> qsh) & 3) << 4)) - 32;
+            int c = (G * u + 128) >> 8;
+            c = c < -127 ? -127 : (c > 127 ? 127 : c);
+            if (jj < 4) w0 |= ((unsigned int) (c & 0xFF)) << (8 * jj);
+            else        w1 |= ((unsigned int) (c & 0xFF)) << (8 * (jj - 4));
+          }
+          out[2 * r]     = w0;
+          out[2 * r + 1] = w1;
+        }
+        *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = out;
+      }
+    } else if constexpr (Q2K) {
+      // Q2_K zero-copy: 84-byte blocks read in place. A 16-element slot is exactly one
+      // group, so (j, sub) and therefore (S, M) are constant across it. Affine like Q4_K.
+      // Mapping verified against the library (rel err 0.8514%).
+      const int kblk = k0 / 256;
+      const int nbk  = K / 256;
+      const int o    = (k0 % 256) / 128;
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        const unsigned char *__restrict__ blk =
+            W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * 84;
+        const unsigned int dlo = (unsigned int) blk[80] | ((unsigned int) blk[81] << 8);
+        const unsigned int dmo = (unsigned int) blk[82] | ((unsigned int) blk[83] << 8);
+        const float d    = __half2float(*(const ggml_half *) &dlo);
+        const float dmin = __half2float(*(const ggml_half *) &dmo);
+
+        const int eoff   = o * 128 + ((wcol[it] * 2) & 127);
+        const int within = eoff % 128;
+        const int j      = within / 32;
+        const int sub    = (within % 32) / 16;
+        const unsigned char sc = blk[o * 8 + j * 2 + sub];
+        const float S = d * (float) (sc & 0xF);
+        const float M = dmin * (float) (sc >> 4);
+        const int F = (int) rintf(S * __uint_as_float(rc_bits));
+        const int C = (int) rintf(M * __uint_as_float(rc_bits));
+        const int shift = 2 * j;
+
+        const unsigned char *__restrict__ qp = blk + 16 + o * 32 + sub * 16;
+        uint4_t out;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          unsigned int w0 = 0, w1 = 0;
+#pragma unroll
+          for (int jj = 0; jj < 8; ++jj) {
+            const int q = ((int) qp[r * 8 + jj] >> shift) & 3;
+            int c = (F * q - C + 128) >> 8;
+            c = c < -127 ? -127 : (c > 127 ? 127 : c);
+            if (jj < 4) w0 |= ((unsigned int) (c & 0xFF)) << (8 * jj);
+            else        w1 |= ((unsigned int) (c & 0xFF)) << (8 * (jj - 4));
+          }
+          out[2 * r]     = w0;
+          out[2 * r + 1] = w1;
+        }
+        *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = out;
+      }
+    } else if constexpr (IQ2XXS || IQ2XS || IQ2S) {
+      // IQ2 family zero-copy. Block sizes differ (66 / 74 / 82 B) and the index and sign
+      // construction differs, but all three share: LBK == 128 covers half of a
+      // 256-element block, one sub-block scale per 32 (IQ2_XXS) or 16 (IQ2_XS/IQ2_S)
+      // elements, and one sign bit per element. A slot stages a 16-element group =
+      // two rows = two 8-element grid entries, eight output bytes each.
+      constexpr int BBSZ = IQ2XXS ? 66 : (IQ2XS ? 74 : 82);
+      const int kblk = k0 / 256;
+      const int nbk  = K / 256;
+      const int half = (k0 % 256) / 128;
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        const unsigned char *__restrict__ blk =
+            W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * BBSZ;
+        const unsigned int dlo = (unsigned int) blk[0] | ((unsigned int) blk[1] << 8);
+        const float d = __half2float(*(const ggml_half *) &dlo);
+
+        const int eoff = half * 128 + ((wcol[it] * 2) & 127);   // element base in the block
+        const int sub  = eoff / 32;                             // 32-element sub-block 0..7
+        const int l0   = (eoff % 32) >> 3;                       // first row: 0 or 2
+
+        uint4_t out;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          const int ll = l0 + r;                                  // row inside the sub-block
+          // The IQ2 grids are uint64_t (8 element bytes per entry); the IQ3 grids are
+          // uint32_t (4). Use a 64-bit holder so no element byte is truncated.
+          unsigned long long g;
+          unsigned int sb;
+          float db;
+          if constexpr (IQ2XXS) {
+            const unsigned char *__restrict__ w8 = blk + 2 + 8 * sub;
+            const unsigned int aux0 = (unsigned int) w8[0] | ((unsigned int) w8[1] << 8)
+                                    | ((unsigned int) w8[2] << 16) | ((unsigned int) w8[3] << 24);
+            const unsigned int aux1 = (unsigned int) w8[4] | ((unsigned int) w8[5] << 8)
+                                    | ((unsigned int) w8[6] << 16) | ((unsigned int) w8[7] << 24);
+            db = d * (0.5f + (float) (aux1 >> 28)) * 0.25f;
+            g  = (unsigned long long) iq2xxs_grid[(aux0 >> (8 * ll)) & 0xFFu];
+            sb = (unsigned int) ksigns_iq2xs[(aux1 >> (7 * ll)) & 127u];
+          } else if constexpr (IQ2XS) {
+            const unsigned int sc = (unsigned int) blk[66 + sub];
+            db = d * (0.5f + (float) ((sc >> ((ll / 2) * 4)) & 0xFu)) * 0.25f;
+            // qs is uint16_t*, so entry (4*sub + ll) sits at byte 2 + 8*sub + 2*ll
+            const unsigned int e = (unsigned int) blk[2 + 8 * sub + 2 * ll]
+                                 | ((unsigned int) blk[2 + 8 * sub + 2 * ll + 1] << 8);
+            g  = (unsigned long long) iq2xs_grid[e & 511u];
+            sb = (unsigned int) ksigns_iq2xs[(e >> 9) & 127u];
+          } else {
+            const unsigned int sc = (unsigned int) blk[74 + sub];
+            db = d * (0.5f + (float) ((sc >> ((ll / 2) * 4)) & 0xFu)) * 0.25f;
+            const unsigned int qh = (unsigned int) blk[66 + sub];
+            const unsigned int idx = (unsigned int) blk[2 + 4 * sub + ll]
+                                   | ((qh << (8 - 2 * ll)) & 0x300u);
+            g  = (unsigned long long) iq2s_grid[idx];
+            sb = (unsigned int) blk[2 + 32 + 4 * sub + ll];      // signs live inside qs
+          }
+          int Pf = (int) rintf(db * __uint_as_float(rc_bits));
+          if (Pf > 4095) Pf = 4095;      // bound is 256*127/grid_min = 256*127/8 = 4064
+          // A row is 8 grid bytes = 8 output bytes = TWO dwords, extracted from the
+          // 64-bit entry. Shifting into bits 32..63 of a 32-bit word would be lost.
+          unsigned int w0 = 0, w1 = 0;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            int c0 = (Pf * (int) ((g >> (8 * j)) & 0xFFull) + 128) >> 8;
+            int c1 = (Pf * (int) ((g >> (8 * (j + 4))) & 0xFFull) + 128) >> 8;
+            if (sb & (1u << j))       c0 = -c0;
+            if (sb & (1u << (j + 4))) c1 = -c1;
+            c0 = c0 < -127 ? -127 : (c0 > 127 ? 127 : c0);
+            c1 = c1 < -127 ? -127 : (c1 > 127 ? 127 : c1);
+            w0 |= ((unsigned int) (c0 & 0xFF)) << (8 * j);
+            w1 |= ((unsigned int) (c1 & 0xFF)) << (8 * j);
+          }
+          // bytes 0..7 of the group are row l0, bytes 8..15 are row l0+1
+          out[2 * r]     = w0;
+          out[2 * r + 1] = w1;
+        }
+        *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = out;
+      }
+    } else if constexpr (IQ3XXS) {
+      // IQ3_XXS zero-copy: 98-byte blocks read in place. LBK == 128 covers half of a
+      // 256-element block, so a slot stages one 16-element group = two rows of a
+      // 32-element sub-block = four 8-element grid entries.
+      const int kblk = k0 / 256;
+      const int nbk  = K / 256;
+      const int half = (k0 % 256) / 128;
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        const unsigned char *__restrict__ blk =
+            W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * 98;
+        const unsigned int dlo = (unsigned int) blk[0] | ((unsigned int) blk[1] << 8);
+        const float d = __half2float(*(const ggml_half *) &dlo);
+
+        const int eoff = half * 128 + ((wcol[it] * 2) & 127);   // element base in the block
+        const int sub  = eoff / 32;                             // 32-element sub-block 0..7
+        const int l0   = (eoff % 32) >> 3;                       // first row: 0 or 2
+
+        const unsigned char *__restrict__ ss = blk + 2 + 64 + 4 * sub;
+        const unsigned int aux = (unsigned int) ss[0] | ((unsigned int) ss[1] << 8)
+                                | ((unsigned int) ss[2] << 16) | ((unsigned int) ss[3] << 24);
+        const float db = d * (0.5f + (float) (aux >> 28)) * 0.5f;   // always positive
+        int Pf = (int) rintf(db * __uint_as_float(rc_bits));
+        if (Pf > 2047) Pf = 2047;
+
+        const unsigned char *__restrict__ qp = blk + 2 + 8 * sub;
+        uint4_t out;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          const int l = l0 + r;
+          // sign byte for this row; bits 0..3 cover grid[idx1], 4..7 cover grid[idx2]
+          const unsigned int sg = (unsigned int) ksigns_iq2xs[(aux >> (7 * l)) & 127u];
+          const unsigned int g1 = iq3xxs_grid[qp[2 * l]];
+          const unsigned int g2 = iq3xxs_grid[qp[2 * l + 1]];
+          // Per byte: code = sign * ((Pf * grid + 128) >> 8). Each lane is extracted,
+          // scaled and sign-flipped as a scalar, so nothing can carry between lanes.
+          unsigned int o1 = 0, o2 = 0;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            int c1 = (Pf * (int) ((g1 >> (8 * j)) & 0xFFu) + 128) >> 8;
+            int c2 = (Pf * (int) ((g2 >> (8 * j)) & 0xFFu) + 128) >> 8;
+            if (sg & (1u << j))       c1 = -c1;
+            if (sg & (1u << (4 + j))) c2 = -c2;
+            c1 = c1 < -127 ? -127 : (c1 > 127 ? 127 : c1);
+            c2 = c2 < -127 ? -127 : (c2 > 127 ? 127 : c2);
+            o1 |= ((unsigned int) (c1 & 0xFF)) << (8 * j);
+            o2 |= ((unsigned int) (c2 & 0xFF)) << (8 * j);
+          }
+          out[2 * r]     = o1;
+          out[2 * r + 1] = o2;
+        }
+        *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = out;
+      }
+    } else if constexpr (IQ3S) {
+      // IQ3_S zero-copy: read the checkpoint's 110-byte blocks in place. LBK == 128, so one
+      // K-slab is half of a 256-element block. A slot stages one 16-element group = two rows
+      // of a 32-element sub-block = four 4-element grid entries.
+      const int kblk = k0 / 256;
+      const int nbk  = K / 256;
+      const int half = (k0 % 256) / 128;
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        const unsigned char *__restrict__ blk =
+            W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * 110;
+        const unsigned int dlo = (unsigned int) blk[0] | ((unsigned int) blk[1] << 8);
+        const float d = __half2float(*(const ggml_half *) &dlo);
+
+        const int eoff = half * 128 + ((wcol[it] * 2) & 127);   // element base in the block
+        const int sub  = eoff / 32;                             // 32-element sub-block 0..7
+        const int p    = sub >> 1;                              // 64-element pair 0..3
+        const int h    = sub & 1;                               // which half of the pair
+        const int l0   = (eoff % 32) >> 3;                       // first row: 0 or 2
+
+        const unsigned int scb = (unsigned int) blk[106 + p];
+        const int ls = h == 0 ? (int) (scb & 0xFu) : (int) (scb >> 4);
+        const float db = d * (float) (1 + 2 * ls);
+        const int sgndb = db < 0.0f ? -1 : 1;
+        int Pf = (int) rintf(fabsf(db) * __uint_as_float(rc_bits));
+        if (Pf > 2167) Pf = 2167;      // 256*127/15, the bound D_row = 15*max|db| implies
+
+        // Two 16-entry tables, positive and negated. Selecting between them with a
+        // byte mask is a pure bit blend, so no carry or borrow can cross byte lanes.
+        // Sign(dl) folds into WHICH table the code comes from; the per-element sign bit
+        // picks between the tables.
+        unsigned int tabp[4], tabn[4];
+#pragma unroll
+        for (int q4 = 0; q4 < 4; ++q4) {
+          unsigned int wp = 0, wn = 0;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            int c = (Pf * (4 * q4 + j) + 128) >> 8;
+            c = c < 127 ? c : 127;                   // Pf*k/256 <= 127 by construction
+            const int cn = sgndb > 0 ? -c : c;
+            wp |= ((unsigned int) (c & 0xFF)) << (8 * j);
+            wn |= ((unsigned int) (cn & 0xFF)) << (8 * j);
+          }
+          tabp[q4] = wp;
+          tabn[q4] = wn;
+        }
+
+        const unsigned char *__restrict__ qsp = blk + 2 + p * 16 + 8 * h;
+        const unsigned int qhh = (unsigned int) blk[66 + 2 * p + h];
+        uint4_t out;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+          const int l = l0 + r;
+          const unsigned int i1 = (unsigned int) qsp[2 * l]     | ((qhh << (8 - 2 * l)) & 256u);
+          const unsigned int i2 = (unsigned int) qsp[2 * l + 1] | ((qhh << (7 - 2 * l)) & 256u);
+          // Four sign bits -> four byte masks, then blend the two tables.
+          const unsigned int sg = (unsigned int) blk[74 + p * 8 + 4 * h + l];
+          const unsigned int m1 = (((sg & 0xFu) * 0x00204081u) & 0x01010101u) * 0xFFu;
+          const unsigned int m2 = (((sg >> 4) * 0x00204081u) & 0x01010101u) * 0xFFu;
+          // two-stage: 512-entry grid -> four 4-bit values -> per-sub-block table
+          const unsigned int g1 = iq3s_grid[i1];
+          const unsigned int g2 = iq3s_grid[i2];
+          const unsigned int a1 = radiance_lut16_from_bytes(g1, tabp);
+          const unsigned int b1 = radiance_lut16_from_bytes(g1, tabn);
+          const unsigned int a2 = radiance_lut16_from_bytes(g2, tabp);
+          const unsigned int b2 = radiance_lut16_from_bytes(g2, tabn);
+          out[2 * r]     = (a1 & ~m1) | (b1 & m1);
+          out[2 * r + 1] = (a2 & ~m2) | (b2 & m2);
+        }
+        *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = out;
+      }
+    } else if constexpr (IQ4XS) {
+      // IQ4_XS zero-copy: read the checkpoint's 136-byte blocks in place. LBK == 128, so one
+      // K-slab is half of a 256-element block. A slot stages one 16-element group; the low
+      // nibbles of qs[sub*16+j] are elements j (0..15) and the high nibbles are j+16.
+      const int kblk = k0 / 256;
+      const int nbk  = K / 256;
+      const int half = (k0 % 256) / 128;
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        const unsigned char *__restrict__ blk =
+            W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * 136;
+        const unsigned int dlo = (unsigned int) blk[0] | ((unsigned int) blk[1] << 8);
+        const float d = __half2float(*(const ggml_half *) &dlo);
+
+        const int eoff = half * 128 + ((wcol[it] * 2) & 127);   // element base in the block
+        const int sub  = eoff / 32;                             // 32-element sub-block 0..7
+        const int whi  = (eoff % 32) / 16;                      // 0: elems 0..15, 1: elems 16..31
+
+        const unsigned int sh = (unsigned int) blk[2] | ((unsigned int) blk[3] << 8);
+        const int ls = (int) ((blk[4 + sub / 2] >> (4 * (sub % 2))) & 0xF)
+                     | (int) (((sh >> (2 * sub)) & 3u) << 4);
+        const float dl = d * (float) (ls - 32);                 // dl is signed
+        const int sgn = dl < 0.0f ? -1 : 1;
+        int F = (int) rintf(fabsf(dl) * __uint_as_float(rc_bits));
+        if (F > 255) F = 255;
+
+        // tab[j] = sgn * round(F * kvalues_iq4nl[j] / 256), four entries per dword.
+        unsigned int tab[4];
+#pragma unroll
+        for (int q4 = 0; q4 < 4; ++q4) {
+          unsigned int w4 = 0;
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const int p = F * (int) kvalues_iq4nl[4 * q4 + j];
+            int c = (p >= 0) ? ((p + 128) >> 8) : -(((-p) + 128) >> 8);
+            c *= sgn;
+            c = c < -127 ? -127 : (c > 127 ? 127 : c);
+            w4 |= ((unsigned int) (c & 0xFF)) << (8 * j);
+          }
+          tab[q4] = w4;
+        }
+
+        const unsigned char *__restrict__ qb = blk + 8 + sub * 16;
+        uint4_t out;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          const unsigned int q = (unsigned int) qb[4 * c]
+                               | ((unsigned int) qb[4 * c + 1] << 8)
+                               | ((unsigned int) qb[4 * c + 2] << 16)
+                               | ((unsigned int) qb[4 * c + 3] << 24);
+          const int2 v = radiance_lut16_i8(q, tab);
+          out[c] = (unsigned int) (whi ? v.y : v.x);
+        }
+        *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = out;
+      }
+    } else if constexpr (IQ1S) {
+      // IQ1_S zero-copy: read the checkpoint's 50-byte blocks in place. LBK == 128, so one
+      // K-slab covers half of a 256-element block: k0/128 selects the block, k0%256 the half.
+      // A slot stages one 16-element group; the two grid rows it spans share dl and delta.
+      const int kblk = k0 / 256;                          // two 128-wide slabs per block
+      const int nbk  = K / 256;
+      const int half = (k0 % 256) / 128;
+#pragma unroll
+      for (int it = 0; it < NW; ++it) {
+        const unsigned char *__restrict__ blk =
+            W + ((size_t) (n0 + wrc[it]) * nbk + kblk) * 50;
+        // rc_bits already holds 8*127/D_row for this thread's row (wrow[it] = tid % BNF_T),
+        // so no Wref reload and no divide per slot.
+        const unsigned int dlo = (unsigned int) blk[0] | ((unsigned int) blk[1] << 8);
+        const float d = __half2float(*(const ggml_half *) &dlo);
+
+        const int eoff = half * 128 + ((wcol[it] * 2) & 127);   // element base in the block
+        const int sub  = eoff / 32;                             // 32-element sub-block 0..7
+        const int l0   = ((eoff % 32) / 16) * 2;                // first grid row: 0 or 2
+
+        const unsigned int qh = (unsigned int) blk[34 + 2 * sub]
+                              | ((unsigned int) blk[35 + 2 * sub] << 8);
+        const float dl = d * (2.0f * (float) ((qh >> 12) & 7) + 1.0f);
+        int M8 = (int) rintf(dl * __uint_as_float(rc_bits));
+        if (M8 > 1016) M8 = 1016;
+
+        const int base = 8 * M8;
+        const int dt   = (qh & 0x8000u) ? -M8 : M8;
+        // The three codes for nibbles 0,1,2; same dword in both operands so the
+        // v_perm operand order does not matter (nibble values are 0..2).
+        int v0 = (-base + dt + 32) >> 6;
+        int v1 = (        dt + 32) >> 6;
+        int v2 = ( base + dt + 32) >> 6;
+        v0 = v0 < -127 ? -127 : (v0 > 127 ? 127 : v0);
+        v1 = v1 < -127 ? -127 : (v1 > 127 ? 127 : v1);
+        v2 = v2 < -127 ? -127 : (v2 > 127 ? 127 : v2);
+        const unsigned int wtab = ((unsigned int) (v0 & 0xFF))
+                                | ((unsigned int) (v1 & 0xFF) << 8)
+                                | ((unsigned int) (v2 & 0xFF) << 16);
+
+        unsigned int out[4];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int l = l0 + h;
+          const unsigned int idx = (unsigned int) blk[2 + 4 * sub + l]
+                                 | (((qh >> (3 * l)) & 7u) << 8);
+          const unsigned int g8 = iq1s_grid_gpu[idx];
+          // low nibble of each byte = elements 0..3, high nibble = elements 4..7
+          out[2 * h]     = __builtin_amdgcn_perm(wtab, wtab, g8 & 0x0F0F0F0Fu);
+          out[2 * h + 1] = __builtin_amdgcn_perm(wtab, wtab, (g8 >> 4) & 0x0F0F0F0Fu);
+        }
+        *(uint4_t *) (&sW[wrow[it] * LWSTR + wcol[it] * 2]) = uint4_t{out[0], out[1], out[2], out[3]};
+      }
     } else {
 #pragma unroll
       for (int it = 0; it < NW; ++it) {
@@ -1063,7 +1648,7 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
       for (int i = 0; i < TM; ++i)
 #pragma unroll
         for (int j = 0; j < TN; ++j) {
-          if constexpr (PTQ1) {
+          if constexpr (PTQ1 || IQ1S || IQ4XS || IQ3S || IQ3XXS || IQ2XXS || IQ2XS || IQ2S || Q4K || Q6K || Q2K || IQ1M) {
             // Same lane convention as the fp8 WMMA, i32 accumulator (no rounding).
             const int2_t av = *(const int2_t *) &af[i][step];
             const int2_t bv = *(const int2_t *) &wf[j];
@@ -1087,6 +1672,13 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
       if (n < N) {
         const unsigned int h = *(const unsigned short *) (Wref + 2 * n);
         rf[j] = ptq1_h2f(h) * (1.0f / 127.0f);
+      }
+    } else if constexpr (IQ1S || IQ4XS || IQ3S || IQ3XXS || IQ2XXS || IQ2XS || IQ2S || Q4K || Q6K || Q2K || IQ1M) {
+      // D_row is the row normaliser; the staged code is 127*w/D_row for all three types.
+      rf[j] = 0.f;
+      if (n < N) {
+        const float dr = __half2float(*(const ggml_half *) (Wref + 2 * n));
+        rf[j] = dr * (1.0f / 127.0f);
       }
     } else {
       rf[j] = (n < N) ? __int_as_float((int)Wref[n] << 23) : 0.f;
@@ -2406,6 +2998,396 @@ __global__ void radiance_gather_scales_ptq1_kernel(const unsigned char * __restr
     if (tid == 0) ((unsigned short *) Wref)[n] = (unsigned short) sh[0];
 }
 
+// IQ1_S row normaliser: D_row = 1.125 * max over the row of dl, as fp16.
+// One block per row; the max runs over 8 sub-block scales per 256-element block.
+__global__ void radiance_gather_scales_iq1s_kernel(const unsigned char * __restrict__ src,
+                                                   int N, int K, unsigned char * __restrict__ Wref) {
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int nb = K / 256;
+    const unsigned char * __restrict__ row = src + (size_t) n * nb * 50;
+    float lmax = 0.0f;
+    for (int b = tid; b < nb; b += stride) {
+        const unsigned char * blk = row + (size_t) b * 50;
+        const float d = __half2float(*(const ggml_half *) blk);
+        for (int ib = 0; ib < 8; ++ib) {
+            const unsigned int qh = (unsigned int) blk[34 + 2 * ib]
+                                  | ((unsigned int) blk[35 + 2 * ib] << 8);
+            const float dl = d * (2.0f * (float) ((qh >> 12) & 7) + 1.0f);
+            if (dl > lmax) lmax = dl;
+        }
+    }
+    __shared__ float sh[256];
+    sh[tid] = lmax;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && sh[tid + off] > sh[tid]) sh[tid] = sh[tid + off];
+        __syncthreads();
+    }
+    // 1.125 = 1 + |delta| so |w| = dl*|g+delta| <= 1.125*dl <= D_row for every element.
+    if (tid == 0) *(ggml_half *) &Wref[2 * n] = __float2half(sh[0] * 1.125f);
+}
+
+// IQ4_XS row normaliser: D_row = 127 * max over the row of |dl|, as fp16.
+// |w|max inside a sub-block is |dl| * max|kvalues_iq4nl| and that max is 127.
+__global__ void radiance_gather_scales_iq4xs_kernel(const unsigned char * __restrict__ src,
+                                                    int N, int K, unsigned char * __restrict__ Wref) {
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nb = K / 256;
+    const unsigned char * __restrict__ row = src + (size_t) n * nb * 136;
+    float m = 0.0f;
+    for (int b = tid; b < nb; b += blockDim.x) {
+        const unsigned char * blk = row + (size_t) b * 136;
+        const float d = __half2float(*(const ggml_half *) blk);
+        const unsigned int sh = (unsigned int) blk[2] | ((unsigned int) blk[3] << 8);
+        for (int ib = 0; ib < 8; ++ib) {
+            const int ls = (int) ((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0xF)
+                         | (int) (((sh >> (2 * ib)) & 3u) << 4);
+            const float a = fabsf(d * (float) (ls - 32));
+            if (a > m) m = a;
+        }
+    }
+    __shared__ float sh[256];
+    sh[tid] = m;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && sh[tid + off] > sh[tid]) sh[tid] = sh[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) *(ggml_half *) &Wref[2 * n] = __float2half(sh[0] * 127.0f);
+}
+
+// IQ3_S row normaliser: D_row = 15 * max over the row of |db|, as fp16.
+// |w| = |db| * k with k in 1..15, so this is an upper bound that needs only the four
+// scale bytes per block -- the gather never decodes the grid.
+__global__ void radiance_gather_scales_iq3s_kernel(const unsigned char * __restrict__ src,
+                                                   int N, int K, unsigned char * __restrict__ Wref) {
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nb = K / 256;
+    const unsigned char * __restrict__ row = src + (size_t) n * nb * 110;
+    float m = 0.0f;
+    for (int b = tid; b < nb; b += blockDim.x) {
+        const unsigned char * blk = row + (size_t) b * 110;
+        const float d = __half2float(*(const ggml_half *) blk);
+        for (int p = 0; p < 4; ++p) {
+            const unsigned int sc = (unsigned int) blk[106 + p];
+            const float a1 = fabsf(d * (float) (1 + 2 * (int) (sc & 0xFu)));
+            const float a2 = fabsf(d * (float) (1 + 2 * (int) (sc >> 4)));
+            if (a1 > m) m = a1;
+            if (a2 > m) m = a2;
+        }
+    }
+    __shared__ float sh[256];
+    sh[tid] = m;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && sh[tid + off] > sh[tid]) sh[tid] = sh[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) *(ggml_half *) &Wref[2 * n] = __float2half(sh[0] * 15.0f);
+}
+
+// IQ3_XXS row normaliser: D_row = max|w| over the row, as fp16.
+// |w| = db * grid_value, so this decodes the grid (4 entries per 32 elements).
+__global__ void radiance_gather_scales_iq3xxs_kernel(const unsigned char * __restrict__ src,
+                                                     int N, int K, unsigned char * __restrict__ Wref) {
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nb = K / 256;
+    const unsigned char * __restrict__ row = src + (size_t) n * nb * 98;
+    float m = 0.0f;
+    for (int b = tid; b < nb; b += blockDim.x) {
+        const unsigned char * blk = row + (size_t) b * 98;
+        const float d = __half2float(*(const ggml_half *) blk);
+        for (int ib = 0; ib < 8; ++ib) {
+            const unsigned char * ss = blk + 2 + 64 + 4 * ib;
+            const unsigned int aux = (unsigned int) ss[0] | ((unsigned int) ss[1] << 8)
+                                   | ((unsigned int) ss[2] << 16) | ((unsigned int) ss[3] << 24);
+            const float db = d * (0.5f + (float) (aux >> 28)) * 0.5f;
+            for (int l = 0; l < 4; ++l) {
+                const unsigned int g1 = iq3xxs_grid[blk[2 + 8 * ib + 2 * l]];
+                const unsigned int g2 = iq3xxs_grid[blk[2 + 8 * ib + 2 * l + 1]];
+                for (int j = 0; j < 4; ++j) {
+                    const float a1 = db * (float) ((g1 >> (8 * j)) & 0xFFu);
+                    const float a2 = db * (float) ((g2 >> (8 * j)) & 0xFFu);
+                    if (a1 > m) m = a1;
+                    if (a2 > m) m = a2;
+                }
+            }
+        }
+    }
+    __shared__ float sh[256];
+    sh[tid] = m;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && sh[tid + off] > sh[tid]) sh[tid] = sh[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) *(ggml_half *) &Wref[2 * n] = __float2half(sh[0]);
+}
+
+// IQ2 family row normaliser: D_row = max|w| over the row, as fp16.
+// |w| = db * grid_value, so the grid is decoded here (8 entries per 32 elements).
+// WHICH: 0 = IQ2_XXS (66 B), 1 = IQ2_XS (74 B), 2 = IQ2_S (82 B).
+template <int WHICH>
+__global__ void radiance_gather_scales_iq2_kernel(const unsigned char * __restrict__ src,
+                                                 int N, int K, unsigned char * __restrict__ Wref) {
+    constexpr int BBSZ = WHICH == 0 ? 66 : (WHICH == 1 ? 74 : 82);
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nb = K / 256;
+    const unsigned char * __restrict__ row = src + (size_t) n * nb * BBSZ;
+    float m = 0.0f;
+    for (int b = tid; b < nb; b += blockDim.x) {
+        const unsigned char * blk = row + (size_t) b * BBSZ;
+        const float d = __half2float(*(const ggml_half *) blk);
+        for (int sub = 0; sub < 8; ++sub) {
+            for (int ll = 0; ll < 4; ++ll) {
+                // IQ2 grids are uint64_t (8 bytes/entry); keep the full value.
+                unsigned long long g;
+                float db;
+                if (WHICH == 0) {
+                    const unsigned char * w8 = blk + 2 + 8 * sub;
+                    const unsigned int aux0 = (unsigned int) w8[0] | ((unsigned int) w8[1] << 8)
+                                            | ((unsigned int) w8[2] << 16) | ((unsigned int) w8[3] << 24);
+                    const unsigned int aux1 = (unsigned int) w8[4] | ((unsigned int) w8[5] << 8)
+                                            | ((unsigned int) w8[6] << 16) | ((unsigned int) w8[7] << 24);
+                    db = d * (0.5f + (float) (aux1 >> 28)) * 0.25f;
+                    g  = (unsigned long long) iq2xxs_grid[(aux0 >> (8 * ll)) & 0xFFu];
+                } else if (WHICH == 1) {
+                    const unsigned int sc = (unsigned int) blk[66 + sub];
+                    db = d * (0.5f + (float) ((sc >> ((ll / 2) * 4)) & 0xFu)) * 0.25f;
+                    const unsigned int e = (unsigned int) blk[2 + 8 * sub + 2 * ll]
+                                         | ((unsigned int) blk[2 + 8 * sub + 2 * ll + 1] << 8);
+                    g  = (unsigned long long) iq2xs_grid[e & 511u];
+                } else {
+                    const unsigned int sc = (unsigned int) blk[74 + sub];
+                    db = d * (0.5f + (float) ((sc >> ((ll / 2) * 4)) & 0xFu)) * 0.25f;
+                    const unsigned int qh = (unsigned int) blk[66 + sub];
+                    const unsigned int idx = (unsigned int) blk[2 + 4 * sub + ll]
+                                           | ((qh << (8 - 2 * ll)) & 0x300u);
+                    g  = (unsigned long long) iq2s_grid[idx];
+                }
+                for (int j = 0; j < 8; ++j) {
+                    const float a = db * (float) ((g >> (8 * j)) & 0xFFull);
+                    if (a > m) m = a;
+                }
+            }
+        }
+    }
+    __shared__ float sh[256];
+    sh[tid] = m;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && sh[tid + off] > sh[tid]) sh[tid] = sh[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) *(ggml_half *) &Wref[2 * n] = __float2half(sh[0]);
+}
+
+// Q4_K row normaliser: D_row = max|w| over the row, as fp16.
+// w = d*sc*q - dmin*m with q in 0..15, so the extreme magnitudes of a group are
+// max(|S*15 - M|, |0 - M|) -- the offset means |w| is NOT monotone in q.
+__global__ void radiance_gather_scales_q4k_kernel(const unsigned char * __restrict__ src,
+                                                  int N, int K, unsigned char * __restrict__ Wref) {
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nb = K / 256;
+    const unsigned char * __restrict__ row = src + (size_t) n * nb * 144;
+    float m = 0.0f;
+    for (int b = tid; b < nb; b += blockDim.x) {
+        const unsigned char * blk = row + (size_t) b * 144;
+        const float d    = __half2float(*(const ggml_half *) blk);
+        const float dmin = __half2float(*(const ggml_half *) (blk + 2));
+        for (int g = 0; g < 8; ++g) {
+            const unsigned char * sc12 = blk + 4;
+            int scv, mv;
+            if (g < 4) {
+                scv = (int) (sc12[g] & 63u);
+                mv  = (int) (sc12[g + 4] & 63u);
+            } else {
+                scv = (int) (sc12[g + 4] & 0xFu) | (((int) (sc12[g - 4]) >> 6) << 4);
+                mv  = (int) (sc12[g + 4] >> 4)   | (((int) (sc12[g])     >> 6) << 4);
+            }
+            const float S = d * (float) scv;
+            const float M = dmin * (float) mv;
+            const float a0 = fabsf(-M);
+            const float a1 = fabsf(S * 15.0f - M);
+            if (a0 > m) m = a0;
+            if (a1 > m) m = a1;
+        }
+    }
+    __shared__ float sh[256];
+    sh[tid] = m;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && sh[tid + off] > sh[tid]) sh[tid] = sh[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) *(ggml_half *) &Wref[2 * n] = __float2half(sh[0]);
+}
+
+// Q6_K row normaliser: D_row = max|w| over the row, as fp16.
+// w = d*sc*(q-32) with q in 0..63, so (q-32) spans -32..+31 and |w| <= d*|sc|*32.
+__global__ void radiance_gather_scales_q6k_kernel(const unsigned char * __restrict__ src,
+                                                  int N, int K, unsigned char * __restrict__ Wref) {
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nb = K / 256;
+    const unsigned char * __restrict__ row = src + (size_t) n * nb * 210;
+    float m = 0.0f;
+    for (int b = tid; b < nb; b += blockDim.x) {
+        const unsigned char * blk = row + (size_t) b * 210;
+        const float d = fabsf(__half2float(*(const ggml_half *) (blk + 208)));
+        for (int i = 0; i < 16; ++i) {
+            const float a = d * fabsf((float) (signed char) blk[192 + i]) * 32.0f;
+            if (a > m) m = a;
+        }
+    }
+    __shared__ float sh[256];
+    sh[tid] = m;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && sh[tid + off] > sh[tid]) sh[tid] = sh[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) *(ggml_half *) &Wref[2 * n] = __float2half(sh[0]);
+}
+
+void ggml_cuda_radiance_gather_scales_q6k(const unsigned char * src, int N, int K,
+                                          unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_q6k_kernel<<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+
+// Q2_K row normaliser: D_row = max|w| over the row, as fp16.
+// w = d*sc*q - dmin*m with q in 0..3 and a per-group (sc, m), so |w| is NOT monotone
+// in q: the candidates are |0 - M| and |S*3 - M|.
+__global__ void radiance_gather_scales_q2k_kernel(const unsigned char * __restrict__ src,
+                                                  int N, int K, unsigned char * __restrict__ Wref) {
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nb = K / 256;
+    const unsigned char * __restrict__ row = src + (size_t) n * nb * 84;
+    float m = 0.0f;
+    for (int b = tid; b < nb; b += blockDim.x) {
+        const unsigned char * blk = row + (size_t) b * 84;
+        // block_q2_K is scales[16] | qs[64] | d | dmin, so d sits at byte 80, NOT at 0.
+        // Reading it from 0 picked up two scale bytes and made D_row meaningless.
+        const float d    = __half2float(*(const ggml_half *) (blk + 80));
+        const float dmin = __half2float(*(const ggml_half *) (blk + 82));
+        for (int g = 0; g < 16; ++g) {
+            const unsigned char sc = blk[g];
+            const float S = d * (float) (sc & 0xF);
+            const float M = dmin * (float) (sc >> 4);
+            const float a0 = fabsf(-M);
+            const float a1 = fabsf(S * 3.0f - M);
+            if (a0 > m) m = a0;
+            if (a1 > m) m = a1;
+        }
+    }
+    __shared__ float sh[256];
+    sh[tid] = m;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && sh[tid + off] > sh[tid]) sh[tid] = sh[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) *(ggml_half *) &Wref[2 * n] = __float2half(sh[0]);
+}
+
+// IQ1_M row normaliser: D_row = 1.125 * max(dl) over the row, as fp16.
+// dl = d*(2*s+1) with a 3-bit s, so the largest dl of a block is d*15 and only the scale
+// fields are needed -- the grid never has to be decoded.
+__global__ void radiance_gather_scales_iq1m_kernel(const unsigned char * __restrict__ src,
+                                                   int N, int K, unsigned char * __restrict__ Wref) {
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nb = K / 256;
+    const unsigned char * __restrict__ row = src + (size_t) n * nb * 56;
+    float m = 0.0f;
+    for (int b = tid; b < nb; b += blockDim.x) {
+        const unsigned char * blk = row + (size_t) b * 56;
+        const unsigned int s0 = (unsigned int) blk[48] | ((unsigned int) blk[49] << 8);
+        const unsigned int s1 = (unsigned int) blk[50] | ((unsigned int) blk[51] << 8);
+        const unsigned int s2 = (unsigned int) blk[52] | ((unsigned int) blk[53] << 8);
+        const unsigned int s3 = (unsigned int) blk[54] | ((unsigned int) blk[55] << 8);
+        const unsigned int dh = ((s0 >> 12) | ((s1 >> 8) & 0x00F0u) |
+                                 ((s2 >> 4) & 0x0F00u) | (s3 & 0xF000u)) & 0xFFFFu;
+        const float d = __half2float(*(const ggml_half *) &dh);
+        const unsigned int all[4] = {s0, s1, s2, s3};
+        int smax = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int f = (int) ((all[i] >> (3 * j)) & 7u);
+                if (f > smax) smax = f;
+            }
+        }
+        const float a = 1.125f * d * (float) (2 * smax + 1);
+        if (a > m) m = a;
+    }
+    __shared__ float sh[256];
+    sh[tid] = m;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off && sh[tid + off] > sh[tid]) sh[tid] = sh[tid + off];
+        __syncthreads();
+    }
+    if (tid == 0) *(ggml_half *) &Wref[2 * n] = __float2half(sh[0]);
+}
+
+void ggml_cuda_radiance_gather_scales_iq1m(const unsigned char * src, int N, int K,
+                                           unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_iq1m_kernel<<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+
+void ggml_cuda_radiance_gather_scales_q2k(const unsigned char * src, int N, int K,
+                                          unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_q2k_kernel<<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+
+void ggml_cuda_radiance_gather_scales_q4k(const unsigned char * src, int N, int K,
+                                          unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_q4k_kernel<<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+
+void ggml_cuda_radiance_gather_scales_iq2xxs(const unsigned char * src, int N, int K,
+                                             unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_iq2_kernel<0><<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+void ggml_cuda_radiance_gather_scales_iq2xs(const unsigned char * src, int N, int K,
+                                            unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_iq2_kernel<1><<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+void ggml_cuda_radiance_gather_scales_iq2s(const unsigned char * src, int N, int K,
+                                           unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_iq2_kernel<2><<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+
+void ggml_cuda_radiance_gather_scales_iq3xxs(const unsigned char * src, int N, int K,
+                                             unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_iq3xxs_kernel<<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+
+void ggml_cuda_radiance_gather_scales_iq3s(const unsigned char * src, int N, int K,
+                                           unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_iq3s_kernel<<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+
+void ggml_cuda_radiance_gather_scales_iq4xs(const unsigned char * src, int N, int K,
+                                           unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_iq4xs_kernel<<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+
+void ggml_cuda_radiance_gather_scales_iq1s(const unsigned char * src, int N, int K,
+                                           unsigned char * Wref, cudaStream_t stream) {
+    radiance_gather_scales_iq1s_kernel<<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
+}
+
 void ggml_cuda_radiance_gather_scales_ptq1(const unsigned char * src, int N, int K,
                                            unsigned char * Wref, cudaStream_t stream) {
     radiance_gather_scales_ptq1_kernel<<<dim3((unsigned) N), 256, 0, stream>>>(src, N, K, Wref);
@@ -2851,7 +3833,10 @@ void ggml_cuda_radiance_quantize_tokens(const float * x, int64_t sx, int64_t K, 
 
 static void launch_at_f32(uintptr_t at, uintptr_t w, uintptr_t ws, uintptr_t wref, uintptr_t as,
                           uintptr_t cf, int M, int N, int K, uintptr_t stream, bool radsc,
-                          bool e6pack = false, bool ptq1 = false) {
+                          bool e6pack = false, bool ptq1 = false, bool iq1s = false, bool iq4xs = false,
+                          bool iq3s = false, bool iq3xxs = false,
+                          bool iq2xxs = false, bool iq2xs = false, bool iq2s = false, bool q4k = false,
+                          bool q6k = false, bool q2k = false, bool iq1m = false) {
     // TN=4 uses a 8x1 wave tile: 512 wide in M, 64 wide in N. This trades A rereads for W
     // rereads, which pays here because A is small and stays in cache while W streams from
     // DRAM: at M=2048/N=6144/K=5120 the A stream grows 503 -> 1007 MB (still well inside the
@@ -2867,23 +3852,53 @@ static void launch_at_f32(uintptr_t at, uintptr_t w, uintptr_t ws, uintptr_t wre
     dim3 fblock(NTHREADS);
     if (M >= 2048 && N >= B4_) {
         dim3 fgrid((N + B4_ - 1) / B4_, (M + BMF4_ - 1) / BMF4_);
-#define RAD_LAUNCH_AT4(RS_, E6P_, P1_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, (E6P_ ? 64 : 128), false, true, RS_, E6P_, TWM4, TWN4, P1_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
-        if (ptq1) RAD_LAUNCH_AT4(false, false, true); else if (e6pack) RAD_LAUNCH_AT4(false, true, false); else if (radsc) RAD_LAUNCH_AT4(true, false, false); else RAD_LAUNCH_AT4(false, false, false);
+#define RAD_LAUNCH_AT4(RS_, E6P_, P1_, Q1_, X4_, S3_, XX_, X2_, S2_, Q2_, K4_, K6_, K2_, M1_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<4, false, (E6P_ ? 64 : 128), false, true, RS_, E6P_, TWM4, TWN4, P1_, Q1_, X4_, S3_, XX_, X2_, S2_, Q2_, K4_, K6_, K2_, M1_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
+        if (ptq1) RAD_LAUNCH_AT4(false, false, true, false, false, false, false, false, false, false, false, false, false, false);
+        else if (iq1s) RAD_LAUNCH_AT4(false, false, false, true, false, false, false, false, false, false, false, false, false, false);
+        else if (iq4xs) RAD_LAUNCH_AT4(false, false, false, false, true, false, false, false, false, false, false, false, false, false);
+        else if (iq3s) RAD_LAUNCH_AT4(false, false, false, false, false, true, false, false, false, false, false, false, false, false);
+        else if (iq3xxs) RAD_LAUNCH_AT4(false, false, false, false, false, false, true, false, false, false, false, false, false, false);
+        else if (iq2xxs) RAD_LAUNCH_AT4(false, false, false, false, false, false, false, true, false, false, false, false, false, false);
+        else if (iq2xs) RAD_LAUNCH_AT4(false, false, false, false, false, false, false, false, true, false, false, false, false, false);
+        else if (iq2s) RAD_LAUNCH_AT4(false, false, false, false, false, false, false, false, false, true, false, false, false, false);
+        else if (q4k) RAD_LAUNCH_AT4(false, false, false, false, false, false, false, false, false, false, true, false, false, false);
+        else if (q6k) RAD_LAUNCH_AT4(false, false, false, false, false, false, false, false, false, false, false, true, false, false);
+        else if (q2k) RAD_LAUNCH_AT4(false, false, false, false, false, false, false, false, false, false, false, false, true, false);
+        else if (iq1m) RAD_LAUNCH_AT4(false, false, false, false, false, false, false, false, false, false, false, false, false, true);
+        else if (e6pack) RAD_LAUNCH_AT4(false, true, false, false, false, false, false, false, false, false, false, false, false, false);
+        else if (radsc) RAD_LAUNCH_AT4(true, false, false, false, false, false, false, false, false, false, false, false, false, false);
+        else RAD_LAUNCH_AT4(false, false, false, false, false, false, false, false, false, false, false, false, false, false);
 #undef RAD_LAUNCH_AT4
     } else {
         constexpr int B_ = BNF_OF(2);
         dim3 fgrid((N + B_ - 1) / B_, (M + BMF - 1) / BMF);
-#define RAD_LAUNCH_AT2(RS_, E6P_, P1_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<2, false, 128, false, true, RS_, E6P_, WM, WN, P1_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
-        if (ptq1) RAD_LAUNCH_AT2(false, false, true); else if (e6pack) RAD_LAUNCH_AT2(false, true, false); else if (radsc) RAD_LAUNCH_AT2(true, false, false); else RAD_LAUNCH_AT2(false, false, false);
+#define RAD_LAUNCH_AT2(RS_, E6P_, P1_, Q1_, X4_, S3_, XX_, X2_, S2_, Q2_, K4_, K6_, K2_, M1_)   hipLaunchKernelGGL((radiance_mxfp4_fp8_gemm_atiled<2, false, 128, false, true, RS_, E6P_, WM, WN, P1_, Q1_, X4_, S3_, XX_, X2_, S2_, Q2_, K4_, K6_, K2_, M1_>), fgrid, fblock, 0, (hipStream_t)stream, (const unsigned char *)at, (const unsigned char *)w, (const unsigned char *)ws, (const unsigned char *)wref, (const float *)as, (__bf16 *)nullptr, M, N, K, 1 << 30, 1 << 30, 0, (const unsigned char *)nullptr, (float *)cf)
+        if (ptq1) RAD_LAUNCH_AT2(false, false, true, false, false, false, false, false, false, false, false, false, false, false);
+        else if (iq1s) RAD_LAUNCH_AT2(false, false, false, true, false, false, false, false, false, false, false, false, false, false);
+        else if (iq4xs) RAD_LAUNCH_AT2(false, false, false, false, true, false, false, false, false, false, false, false, false, false);
+        else if (iq3s) RAD_LAUNCH_AT2(false, false, false, false, false, true, false, false, false, false, false, false, false, false);
+        else if (iq3xxs) RAD_LAUNCH_AT2(false, false, false, false, false, false, true, false, false, false, false, false, false, false);
+        else if (iq2xxs) RAD_LAUNCH_AT2(false, false, false, false, false, false, false, true, false, false, false, false, false, false);
+        else if (iq2xs) RAD_LAUNCH_AT2(false, false, false, false, false, false, false, false, true, false, false, false, false, false);
+        else if (iq2s) RAD_LAUNCH_AT2(false, false, false, false, false, false, false, false, false, true, false, false, false, false);
+        else if (q4k) RAD_LAUNCH_AT2(false, false, false, false, false, false, false, false, false, false, true, false, false, false);
+        else if (q6k) RAD_LAUNCH_AT2(false, false, false, false, false, false, false, false, false, false, false, true, false, false);
+        else if (q2k) RAD_LAUNCH_AT2(false, false, false, false, false, false, false, false, false, false, false, false, true, false);
+        else if (iq1m) RAD_LAUNCH_AT2(false, false, false, false, false, false, false, false, false, false, false, false, false, true);
+        else if (e6pack) RAD_LAUNCH_AT2(false, true, false, false, false, false, false, false, false, false, false, false, false, false);
+        else if (radsc) RAD_LAUNCH_AT2(true, false, false, false, false, false, false, false, false, false, false, false, false, false);
+        else RAD_LAUNCH_AT2(false, false, false, false, false, false, false, false, false, false, false, false, false, false);
 #undef RAD_LAUNCH_AT2
     }
 }
 
 void ggml_cuda_radiance_gemm_f32(const void * a_q, const void * w, const void * ws, const void * wref,
                                  const float * as, float * c, int M, int N, int K, cudaStream_t stream,
-                                 bool radsc, bool e6pack, bool ptq1) {
+                                 bool radsc, bool e6pack, bool ptq1, bool iq1s, bool iq4xs, bool iq3s, bool iq3xxs,
+                                 bool iq2xxs, bool iq2xs, bool iq2s, bool q4k, bool q6k, bool q2k, bool iq1m) {
     launch_at_f32((uintptr_t) a_q, (uintptr_t) w, (uintptr_t) ws, (uintptr_t) wref,
-                  (uintptr_t) as, (uintptr_t) c, M, N, K, (uintptr_t) stream, radsc, e6pack, ptq1);
+                  (uintptr_t) as, (uintptr_t) c, M, N, K, (uintptr_t) stream, radsc, e6pack, ptq1, iq1s, iq4xs,
+                  iq3s, iq3xxs, iq2xxs, iq2xs, iq2s, q4k, q6k, q2k, iq1m);
 }
 
 bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t ne01,
@@ -2904,7 +3919,37 @@ bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t 
     // normalised int8 weights and the activations are int8. Needs K % 128 == 0 because
     // one 128-element block is the unit of both the trit packing and the scale.
     const bool ptq1_ok = type == GGML_TYPE_PTQ1_0 && ne00 % 128 == 0;
-    return amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) && (type_ok || ptq1_ok) &&
+    // IQ1_S joins the int8 datapath: its codebook rows decode to row-normalised int8 and the
+    // activations are int8. Needs K % 256 == 0 because the 256-element block is the unit of
+    // the codebook packing, the sub-block scales and the delta sign.
+    const bool iq1s_ok = type == GGML_TYPE_IQ1_S && ne00 % 256 == 0;
+    // IQ4_XS joins the same int8 datapath: its 16-entry int8 codebook is stretched by a
+    // per-sub-block factor folded into 8 fixed-point bits, and the row scale lands in the
+    // epilogue. Needs K % 256 == 0 (the 256-element block is the packing unit).
+    const bool iq4xs_ok = type == GGML_TYPE_IQ4_XS && ne00 % 256 == 0;
+    // IQ3_S: a 512-entry 4-bit grid followed by a per-sub-block table, same int8 datapath.
+    const bool iq3s_ok = type == GGML_TYPE_IQ3_S && ne00 % 256 == 0;
+    // IQ3_XXS: a 256-entry grid of 4-bit values (range 4..62) with a per-sub-block scale
+    // and a sign byte; the staged code is produced by direct integer multiply.
+    const bool iq3xxs_ok = type == GGML_TYPE_IQ3_XXS && ne00 % 256 == 0;
+    // IQ2 family: 8-element grid entries (values 8..43) with a per-sub-block scale and one
+    // sign bit per element; staged through the same direct-integer-multiply scheme.
+    // GGML_RAD_IQ2_DISABLE isolates the IQ2 contribution in an A/B, like the MXFP6 switch.
+    const bool iq2_ok = (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+                         type == GGML_TYPE_IQ2_S) && ne00 % 256 == 0 &&
+                        getenv("GGML_RAD_IQ2_DISABLE") == nullptr;
+    // Q4_K: affine 4-bit (w = d*sc*q - dmin*m). The offset is folded into the code with
+    // a per-group C term, so the staged value is still one int8 plus a row scale.
+    const bool q4k_ok = type == GGML_TYPE_Q4_K && ne00 % 256 == 0;
+    // Q6_K: ql/qh 6-bit codes with a signed int8 scale and a -32 offset, no min term.
+    // Q2_K: affine 2-bit (w = d*sc*q - dmin*m), the same fold as Q4_K with a 4-bit scale.
+    const bool q6k_ok = type == GGML_TYPE_Q6_K && ne00 % 256 == 0;
+    const bool q2k_ok = type == GGML_TYPE_Q2_K && ne00 % 256 == 0;
+    // IQ1_M: 1.75 bpw ternary grid with a per-row delta and a per-16 dl, folded like IQ1_S.
+    const bool iq1m_ok = type == GGML_TYPE_IQ1_M && ne00 % 256 == 0;
+    return amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA4(cc) &&
+        (type_ok || ptq1_ok || iq1s_ok || iq4xs_ok || iq3s_ok || iq3xxs_ok || iq2_ok || q4k_ok ||
+         q6k_ok || q2k_ok || iq1m_ok) &&
         ne11 >= min_m && ne00 % 64 == 0 && ne10 == ne00 && (ne01 % 16 == 0) && contiguous_dst;
 }
 

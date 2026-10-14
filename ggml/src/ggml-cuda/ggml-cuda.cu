@@ -2942,9 +2942,10 @@ static bool ggml_cuda_try_add_rms_norm_quant_fused(ggml_backend_cuda_context & c
     }
 
     const ggml_tensor * w = mm->src[0];
-    // PTQ1_0 consumes int8 activations, so the e4m3 this fusion would produce is useless
-    // to it; leave those to the plain path until the fusion can emit int8.
-    if (w->type == GGML_TYPE_PTQ1_0) {
+    // int8 radiance types consume signed char activations, so the e4m3 this fusion would
+    // produce is useless to them; leave those to the plain path until the fusion can emit
+    // int8.
+    if (ggml_cuda_radiance_is_int8_type(w->type)) {
         return false;
     }
     const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
