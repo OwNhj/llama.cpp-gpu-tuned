@@ -774,6 +774,10 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
   __shared__ unsigned char sW[BNF_T * LWSTR];
   __shared__ unsigned int sMag[32];   // kMag, 128 B: ds_load keeps the lookup off the loadcnt chain
   __shared__ unsigned int sTab[7 * 4];
+  // IQ4_XS code tables: tab[j] = round(F * kvalues_iq4nl[j] / 256) for F in 0..255, in both
+  // the positive and negated form (16 bytes each). Built once per block instead of rebuilt
+  // per slot. 8 KB, only referenced by the IQ4XS instantiation.
+  __shared__ unsigned char sIq4[2 * 256 * 16];
 
 
   const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
@@ -921,6 +925,25 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
     for (int j = 0; j < TN; ++j)
 #pragma unroll
       for (int e = 0; e < 8; ++e) acc[i][j][e] = 0;
+
+  if constexpr (IQ4XS) {
+    // 512 tables, 16 bytes each; 256 threads fill them in two rounds.
+    for (int t = tid; t < 512; t += NTHREADS_T) {
+      const int F = t >> 1;
+      const int neg = t & 1;
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        const int p = F * (int) kvalues_iq4nl[j];
+        int c = (p >= 0) ? ((p + 128) >> 8) : -(((-p) + 128) >> 8);
+        c = c < -127 ? -127 : (c > 127 ? 127 : c);
+        if (neg) c = -c;
+        sIq4[t * 16 + j] = (unsigned char) (c & 0xFF);
+      }
+    }
+    // The table a thread reads depends on its row scale, so it is generally written by a
+    // different thread; the build must complete before any lookup.
+    __syncthreads();
+  }
 
   for (int k0 = 0; k0 < K; k0 += LBK) {
     // A fragments straight from global: one SADDR clause, consumed only at the WMMAs.
@@ -1527,21 +1550,10 @@ __global__ __launch_bounds__(TWM * TWN * 32) void radiance_mxfp4_fp8_gemm_atiled
         int F = (int) rintf(fabsf(dl) * __uint_as_float(rc_bits));
         if (F > 255) F = 255;
 
-        // tab[j] = sgn * round(F * kvalues_iq4nl[j] / 256), four entries per dword.
-        unsigned int tab[4];
-#pragma unroll
-        for (int q4 = 0; q4 < 4; ++q4) {
-          unsigned int w4 = 0;
-#pragma unroll
-          for (int j = 0; j < 4; ++j) {
-            const int p = F * (int) kvalues_iq4nl[4 * q4 + j];
-            int c = (p >= 0) ? ((p + 128) >> 8) : -(((-p) + 128) >> 8);
-            c *= sgn;
-            c = c < -127 ? -127 : (c > 127 ? 127 : c);
-            w4 |= ((unsigned int) (c & 0xFF)) << (8 * j);
-          }
-          tab[q4] = w4;
-        }
+        // Table lookup instead of a 16-iteration rebuild. The tables were built once per
+        // block before the K loop.
+        const unsigned int *__restrict__ tab =
+            (const unsigned int *) (sIq4 + ((F << 1) | (sgn < 0 ? 1 : 0)) * 16);
 
         const unsigned char *__restrict__ qb = blk + 8 + sub * 16;
         uint4_t out;
