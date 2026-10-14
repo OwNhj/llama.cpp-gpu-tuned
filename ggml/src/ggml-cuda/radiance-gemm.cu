@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "fwht.cuh"
+#include "radiance-gemm.cuh"
 #include <hip/hip_runtime.h>
 #include <cmath>
 #include <map>
@@ -3960,6 +3961,9 @@ bool ggml_cuda_radiance_supported(int cc, ggml_type type, int64_t ne00, int64_t 
 // q here saves that read plus one kernel launch. y is ALWAYS written (the plain down path and
 // any non-fast consumer still need it); only the e4m3 pass is memoized: the (gate, up) row
 // signature lets a repeated call skip requantizing byte-identical rows.
+// INT8 mirrors add_rms_quant_fused_kernel: signed-char codes with scale = amax/127
+// instead of e4m3 with amax/448. Same two differences only, so one flag covers both.
+template <bool INT8 = false>
 __global__ void swiglu_quant_fused_kernel(
         const float * __restrict__ gate, const float * __restrict__ up,
         float * __restrict__ y, unsigned char * __restrict__ q,
@@ -4022,7 +4026,7 @@ __global__ void swiglu_quant_fused_kernel(
     if (tid == 0) {
         float amax = 0.0f;
         for (int i = 0; i < nthreads / 32; ++i) amax = fmaxf(amax, sh[i]);
-        scale[row] = amax > 0.0f ? amax / 448.0f : 0.0f;
+        scale[row] = amax > 0.0f ? (INT8 ? amax / 127.0f : amax / 448.0f) : 0.0f;
     }
     __syncthreads();
     const float d = scale[row];
@@ -4032,8 +4036,20 @@ __global__ void swiglu_quant_fused_kernel(
     const int lrow = (int)(row & 15);
     for (int64_t k = tid * 4; k < N; k += (int64_t)nthreads * 4) {
         const float4 yv = *(const float4 *)(yr + k);
-        const uint32_t p0 = ggml_cuda_fp32x2_to_e4m3x2(yv.x * dinv, yv.y * dinv);
-        const uint32_t p1 = ggml_cuda_fp32x2_to_e4m3x2(yv.z * dinv, yv.w * dinv);
+        uint32_t p0, p1;
+        if constexpr (INT8) {
+            // d = amax/127, so |y*dinv| <= 127 by construction and the low byte of the
+            // rounded int is already the saturated code. Same as quantize_tokens_i8.
+            const int c0 = __float2int_rn(yv.x * dinv);
+            const int c1 = __float2int_rn(yv.y * dinv);
+            const int c2 = __float2int_rn(yv.z * dinv);
+            const int c3 = __float2int_rn(yv.w * dinv);
+            p0 = ((uint32_t) (c0 & 0xFF)) | (((uint32_t) (c1 & 0xFF)) << 8);
+            p1 = ((uint32_t) (c2 & 0xFF)) | (((uint32_t) (c3 & 0xFF)) << 8);
+        } else {
+            p0 = ggml_cuda_fp32x2_to_e4m3x2(yv.x * dinv, yv.y * dinv);
+            p1 = ggml_cuda_fp32x2_to_e4m3x2(yv.z * dinv, yv.w * dinv);
+        }
         const int64_t pos = (frag_row + (k >> 4)) * 256 + (lrow + 16 * ((int)((k >> 3) & 1))) * 8 + (k & 7);
         *(uint32_t *)(q + pos) = (p0 & 0xFFFFu) | ((p1 & 0xFFFFu) << 16);
     }
@@ -4233,7 +4249,13 @@ bool ggml_cuda_radiance_add_rms_norm_quant(const float * a, const float * b, con
         RAD_A2_DISPATCH(1024);
     }
 #undef RAD_A2_DISPATCH
-    ggml_rad_fused_acts[act_key] = { bb.q, bb.scale, ncols, true, int8_out };
+    {
+        ggml_rad_fused_act e;
+        e.q = bb.q; e.scale = bb.scale; e.K = ncols;
+        e.int8 = int8_out;
+        e.once = true;
+        ggml_rad_fused_acts[act_key] = e;
+    }
     return true;
 }
 
@@ -4270,12 +4292,17 @@ bool ggml_cuda_try_swiglu_quant_fused(ggml_backend_cuda_context & ctx, const ggm
         return false;
     }
     // the weights must be a radiance type, else the downstream down-GEMM cannot consume q.
-    const auto rad_type = [](ggml_type t) {
-        return t == GGML_TYPE_MXFP4 || t == GGML_TYPE_MXFP4_RAD;
-    };
+    // Any type the radiance GEMM accepts works: int8 types take the signed-char arm below,
+    // fp8 types the e4m3 arm.
+    const auto rad_type = [](ggml_type t) { return ggml_cuda_radiance_is_int8_type(t) ||
+                                                   t == GGML_TYPE_MXFP4 || t == GGML_TYPE_MXFP4_RAD ||
+                                                   t == GGML_TYPE_MXFP6; };
     if (!rad_type(gsrc->src[0]->type) || !rad_type(usrc->src[0]->type)) {
         return false;
     }
+    // both operands feed one activation buffer, so they must agree on the convention
+    const bool int8_out = ggml_cuda_radiance_is_int8_type(gsrc->src[0]->type) ||
+                          ggml_cuda_radiance_is_int8_type(usrc->src[0]->type);
     const int64_t N = dst->ne[0];
     const int64_t M = dst->ne[1];
     const int64_t min_m = getenv("GGML_RAD_PREFILL_MIN_M") ? atoll(getenv("GGML_RAD_PREFILL_MIN_M")) : 256;
@@ -4298,9 +4325,21 @@ bool ggml_cuda_try_swiglu_quant_fused(ggml_backend_cuda_context & ctx, const ggm
         return false;
     }
     const dim3 grid(1, (unsigned) M);
-    swiglu_quant_fused_kernel<<<grid, 256, 0, ctx.stream()>>>(
-        (const float *) gate->data, (const float *) up->data, (float *) dst->data,
-        b.q, b.scale, b.hashes, N, M, gs, us);
-    ggml_rad_fused_acts[dst->data] = { b.q, b.scale, N, false, false };
+    if (int8_out) {
+        swiglu_quant_fused_kernel<true><<<grid, 256, 0, ctx.stream()>>>(
+            (const float *) gate->data, (const float *) up->data, (float *) dst->data,
+            b.q, b.scale, b.hashes, N, M, gs, us);
+    } else {
+        swiglu_quant_fused_kernel<false><<<grid, 256, 0, ctx.stream()>>>(
+            (const float *) gate->data, (const float *) up->data, (float *) dst->data,
+            b.q, b.scale, b.hashes, N, M, gs, us);
+    }
+    {
+        ggml_rad_fused_act e;
+        e.q = b.q; e.scale = b.scale; e.K = N;
+        e.int8 = int8_out;
+        e.once = false;
+        ggml_rad_fused_acts[dst->data] = e;
+    }
     return true;
 }
