@@ -396,11 +396,19 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
     const bool iq1m   = src0->type == GGML_TYPE_IQ1_M;
     unsigned char * q8 = nullptr;
     float * as = nullptr;
-    // PTQ1_0 and IQ1_S need int8 activations, so they must not consume the e4m3 buffer the
-    // fused producers (add_rms/swiglu) register, nor the fp8 quantizer's row-fingerprint memo.
-    if (!ptq1 && !iq1s && !iq4xs && !iq3s && ggml_rad_fused_act_lookup(src1->data, K, (const unsigned char **) &q8, (const float **) &as)) {
-        // reuse the fused producer's e4m3
-    } else if (ptq1 || iq1s || iq4xs || iq3s || iq3xxs || iq2xxs || iq2xs || iq2s || q4k || q6k || q2k || iq1m) {
+    // A fused producer may have written this activation already. int8 types need signed-char
+    // codes and fp8 types need e4m3, so accept the buffer only when its convention matches
+    // the weight type; the producer records which one it wrote.
+    const bool need_int8 = ptq1 || iq1s || iq4xs || iq3s || iq3xxs || iq2xxs || iq2xs ||
+                           iq2s || q4k || q6k || q2k || iq1m;
+    bool fused_int8 = false;
+    const bool fused_hit = ggml_rad_fused_act_lookup(src1->data, K, (const unsigned char **) &q8,
+                                                     (const float **) &as, &fused_int8);
+    if (fused_hit && fused_int8 == need_int8) {
+        // reuse the fused producer's activation (e4m3 for fp8 weights, int8 otherwise)
+    } else if (need_int8) {
+        // reaches here either when no producer registered this activation, or when one did
+        // but wrote e4m3 (fused_int8 != need_int8); either way requantize to int8 below.
         signed char * q8s = nullptr;
         // A fused Hadamard producer may already have written this activation's int8 codes and row
         // scales; only PTQ1_0 activations land in that registry (see ggml_cuda_try_fwht_quant_i8),

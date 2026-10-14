@@ -4046,6 +4046,10 @@ struct ggml_rad_fused_act {
     unsigned char * q;
     float * scale;
     int64_t K;
+    // true when the producer wrote signed-char codes (scale = amax/127), false for e4m3
+    // (scale = amax/448). The two conventions are not interchangeable, and the gate that
+    // used to exclude int8 types outright is gone, so the consumer must check this.
+    bool int8;
     // A one-shot entry is erased by the first lookup. The map is keyed by a data pointer and the
     // graph allocator reuses addresses across layers, so a producer whose activation width repeats
     // every layer (the norm output, K = n_embd) could otherwise hand a later layer the previous
@@ -4059,13 +4063,16 @@ void ggml_rad_fused_acts_reset(void) {
 }
 
 bool ggml_rad_fused_act_lookup(const void * act, int64_t K,
-                               const unsigned char ** q, const float ** scale) {
+                               const unsigned char ** q, const float ** scale, bool * int8) {
     auto it = ggml_rad_fused_acts.find(act);
     if (it == ggml_rad_fused_acts.end() || it->second.K != K) {
         return false;
     }
     *q = it->second.q;
     *scale = it->second.scale;
+    if (int8) {
+        *int8 = it->second.int8;
+    }
     if (it->second.once) {
         ggml_rad_fused_acts.erase(it);
     }
@@ -4083,7 +4090,11 @@ bool ggml_rad_fused_act_lookup(const void * act, int64_t K,
 // accumulation per thread, then block_reduce<SUM>. The norm values therefore stay bit-identical to
 // the unfused kernel, and the amax below sees the same f32 values the standalone quantize pass
 // would read back, in the same expression order (rscale * residual * weight).
-template <int NTH, int NIT>
+// INT8 selects the signed-char activation convention the radiance int8 datapath consumes:
+// scale = amax/127 and codes = round(x/scale), against e4m3's amax/448 with hardware
+// cvt_pk_fp8_f32. Only those two things differ, so one flag covers both and the e4m3
+// instantiation's codegen is unchanged.
+template <int NTH, int NIT, bool INT8 = false>
 __global__ void add_rms_quant_fused_kernel(
         const float * __restrict__ a, const float * __restrict__ b,
         const float * __restrict__ weight, float * __restrict__ residual,
@@ -4123,7 +4134,10 @@ __global__ void add_rms_quant_fused_kernel(
         }
     }
     amax = block_reduce<block_reduce_method::MAX, NTH>(amax, lds2);
-    const float d = amax > 0.0f ? amax / 448.0f : 0.0f;
+    // Divide rather than multiply by a reciprocal: the unfused int8 path uses
+    // `amax / 127.0f` and the e4m3 path used `amax / 448.0f`, and a reciprocal product
+    // differs in the last ulp for most inputs, which moves the quantized codes.
+    const float d = amax > 0.0f ? (INT8 ? amax / 127.0f : amax / 448.0f) : 0.0f;
     if (tid == 0) {
         scale[row] = d;
         // q is written unconditionally, so retire this row's memo signature. A later
@@ -4140,8 +4154,23 @@ __global__ void add_rms_quant_fused_kernel(
     const int lrow = (int) (row & 15);
     for (int64_t k = tid * 4; k < ncols; k += (int64_t) NTH * 4) {
         const float4 nv = *(const float4 *) (dr + k);
-        const uint32_t p0 = ggml_cuda_fp32x2_to_e4m3x2(nv.x * dinv, nv.y * dinv);
-        const uint32_t p1 = ggml_cuda_fp32x2_to_e4m3x2(nv.z * dinv, nv.w * dinv);
+        uint32_t p0, p1;
+        if constexpr (INT8) {
+            // d = amax/127, so |v*dinv| <= 127 for every element and the low byte of the
+            // rounded int is already the saturated code: no clamp is needed (same argument
+            // as quantize_tokens_i8).
+            const int c0 = __float2int_rn(nv.x * dinv);
+            const int c1 = __float2int_rn(nv.y * dinv);
+            const int c2 = __float2int_rn(nv.z * dinv);
+            const int c3 = __float2int_rn(nv.w * dinv);
+            // The store below is (p0 & 0xFFFF) | ((p1 & 0xFFFF) << 16), so p0 carries the
+            // first two bytes and p1 the last two -- the same split the e4m3 pair uses.
+            p0 = ((uint32_t) (c0 & 0xFF)) | (((uint32_t) (c1 & 0xFF)) << 8);
+            p1 = ((uint32_t) (c2 & 0xFF)) | (((uint32_t) (c3 & 0xFF)) << 8);
+        } else {
+            p0 = ggml_cuda_fp32x2_to_e4m3x2(nv.x * dinv, nv.y * dinv);
+            p1 = ggml_cuda_fp32x2_to_e4m3x2(nv.z * dinv, nv.w * dinv);
+        }
         const int64_t pos = (frag_row + (k >> 4)) * 256 + (lrow + 16 * ((int) ((k >> 3) & 1))) * 8 + (k & 7);
         *(uint32_t *) (q + pos) = (p0 & 0xFFFFu) | ((p1 & 0xFFFFu) << 16);
     }
@@ -4150,18 +4179,34 @@ __global__ void add_rms_quant_fused_kernel(
 #define RAD_A2_DISPATCH(NTH_)                                                                     \
     do {                                                                                          \
         const int nit = (int) ((ncols + NTH_ - 1) / NTH_);                                         \
-        switch (nit) {                                                                             \
-            case 1: add_rms_quant_fused_kernel<NTH_, 1><<<grid, NTH_, 0, stream>>>(                \
-                        a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
-            case 2: add_rms_quant_fused_kernel<NTH_, 2><<<grid, NTH_, 0, stream>>>(                \
-                        a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
-            case 3: add_rms_quant_fused_kernel<NTH_, 3><<<grid, NTH_, 0, stream>>>(                \
-                        a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
-            case 4: add_rms_quant_fused_kernel<NTH_, 4><<<grid, NTH_, 0, stream>>>(                \
-                        a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
-            case 5: add_rms_quant_fused_kernel<NTH_, 5><<<grid, NTH_, 0, stream>>>(                \
-                        a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
-            default: return false;                                                                 \
+        if (int8_out) {                                                                            \
+            switch (nit) {                                                                         \
+                case 1: add_rms_quant_fused_kernel<NTH_, 1, true><<<grid, NTH_, 0, stream>>>(      \
+                            a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+                case 2: add_rms_quant_fused_kernel<NTH_, 2, true><<<grid, NTH_, 0, stream>>>(      \
+                            a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+                case 3: add_rms_quant_fused_kernel<NTH_, 3, true><<<grid, NTH_, 0, stream>>>(      \
+                            a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+                case 4: add_rms_quant_fused_kernel<NTH_, 4, true><<<grid, NTH_, 0, stream>>>(      \
+                            a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+                case 5: add_rms_quant_fused_kernel<NTH_, 5, true><<<grid, NTH_, 0, stream>>>(      \
+                            a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+                default: return false;                                                             \
+            }                                                                                      \
+        } else {                                                                                   \
+            switch (nit) {                                                                         \
+                case 1: add_rms_quant_fused_kernel<NTH_, 1><<<grid, NTH_, 0, stream>>>(            \
+                            a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+                case 2: add_rms_quant_fused_kernel<NTH_, 2><<<grid, NTH_, 0, stream>>>(            \
+                            a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+                case 3: add_rms_quant_fused_kernel<NTH_, 3><<<grid, NTH_, 0, stream>>>(            \
+                            a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+                case 4: add_rms_quant_fused_kernel<NTH_, 4><<<grid, NTH_, 0, stream>>>(            \
+                            a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+                case 5: add_rms_quant_fused_kernel<NTH_, 5><<<grid, NTH_, 0, stream>>>(            \
+                            a, b, weight, residual, norm, bb.q, bb.scale, bb.hashes, (int) ncols, eps); break; \
+                default: return false;                                                             \
+            }                                                                                      \
         }                                                                                          \
     } while (0)
 
@@ -4170,7 +4215,7 @@ __global__ void add_rms_quant_fused_kernel(
 bool ggml_cuda_radiance_add_rms_norm_quant(const float * a, const float * b, const float * weight,
                                            float * residual, float * norm, const void * act_key,
                                            int64_t ncols, int64_t nrows, float eps,
-                                           cudaStream_t stream) {
+                                           cudaStream_t stream, bool int8_out) {
     if (getenv("GGML_RAD_DISABLE") || getenv("GGML_RAD_FUSE_OFF") || getenv("GGML_RAD_NORM_QUANT_OFF")) {
         return false;
     }
@@ -4188,7 +4233,7 @@ bool ggml_cuda_radiance_add_rms_norm_quant(const float * a, const float * b, con
         RAD_A2_DISPATCH(1024);
     }
 #undef RAD_A2_DISPATCH
-    ggml_rad_fused_acts[act_key] = { bb.q, bb.scale, ncols, true };
+    ggml_rad_fused_acts[act_key] = { bb.q, bb.scale, ncols, true, int8_out };
     return true;
 }
 
@@ -4256,6 +4301,6 @@ bool ggml_cuda_try_swiglu_quant_fused(ggml_backend_cuda_context & ctx, const ggm
     swiglu_quant_fused_kernel<<<grid, 256, 0, ctx.stream()>>>(
         (const float *) gate->data, (const float *) up->data, (float *) dst->data,
         b.q, b.scale, b.hashes, N, M, gs, us);
-    ggml_rad_fused_acts[dst->data] = { b.q, b.scale, N, false };
+    ggml_rad_fused_acts[dst->data] = { b.q, b.scale, N, false, false };
     return true;
 }

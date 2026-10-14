@@ -95,7 +95,7 @@ bool ggml_cuda_try_swiglu_quant_fused(ggml_backend_cuda_context & ctx, const ggm
 bool ggml_cuda_radiance_add_rms_norm_quant(const float * a, const float * b, const float * weight,
                                            float * residual, float * norm, const void * act_key,
                                            int64_t ncols, int64_t nrows, float eps,
-                                           cudaStream_t stream);
+                                           cudaStream_t stream, bool int8_out = false);
 // transform width the fused PTQ1_0 Hadamard + int8 quantizer is instantiated for
 #define FWHT_I8_N 1024
 
@@ -115,5 +115,6 @@ void ggml_rad_fwht_i8_acts_reset(void);
 bool ggml_cuda_radiance_weight_ready(const void * w);
 
 bool ggml_rad_fused_act_lookup(const void * act, int64_t K,
-                               const unsigned char ** q, const float ** scale);
+                               const unsigned char ** q, const float ** scale,
+                               bool * int8 = nullptr);
 void ggml_rad_fused_acts_reset(void);
