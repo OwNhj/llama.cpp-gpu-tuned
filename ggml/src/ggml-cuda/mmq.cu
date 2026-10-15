@@ -145,6 +145,7 @@ struct ggml_radiance_weight {
     int    device;
     bool   own_w = true;   // false when W aliases the weight buffer (MXFP4_RAD)
     bool   e6pack = false; // MXFP6 packed: read the checkpoint bytes in place, fold to e4m3
+    bool   mx8    = false; // MXFP8 zero-copy: e4m3 in place, e8m0 folded by exponent shift
 };
 
 static std::unordered_map<const void *, ggml_radiance_weight> g_radiance_weights;
@@ -246,9 +247,44 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
                                    src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ2_XXS ||
                                    src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ2_S ||
                                    src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K ||
-                                   src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_IQ1_M)
+                                   src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_IQ1_M ||
+                                   src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q2_0 ||
+                                   src0->type == GGML_TYPE_Q8_0)
                                 ? (size_t) 2 * N : (size_t) N;
-        if (src0->type == GGML_TYPE_MXFP6) {
+        if (src0->type == GGML_TYPE_Q8_0) {
+            // Q8_0 zero-copy: the staging folds each block's fp16 d against the row max, so
+            // W aliases the 34-byte blocks and only Wref is materialised.
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales_q80((const unsigned char *) src0->data, N, K,
+                                                 (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q2_0) {
+            // Q4_0 / Q2_0 zero-copy: the staging reads the 18-byte blocks in place and folds
+            // the affine scale into the int8 code, so W aliases the weight buffer.
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            if (src0->type == GGML_TYPE_Q4_0)
+                ggml_cuda_radiance_gather_scales_q40((const unsigned char *) src0->data, N, K,
+                                                     (unsigned char *) w.Wref, stream);
+            else
+                ggml_cuda_radiance_gather_scales_q20((const unsigned char *) src0->data, N, K,
+                                                     (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_MXFP8) {
+            // MXFP8 zero-copy: W aliases the checkpoint's 264-byte blocks; the atiled MX8
+            // staging folds each block's e8m0 into its e4m3 bytes. Only Wref (row max e,
+            // minus 9 to absorb the 1/512) is materialised.
+            w.own_w  = false;
+            w.mx8    = true;
+            w.W      = (unsigned char *) src0->data;
+            w.Ws     = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales_mxfp8((const unsigned char *) src0->data, N, K,
+                                                   (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_MXFP6) {
             // MXFP6 zero-copy: the atiled E6PACK path reads the checkpoint's packed 6-bit bytes
             // in place and folds them to e4m3, so W aliases the weight buffer and there is no
             // scale plane to stage (each source block carries its own e[] tail, read in situ).
@@ -394,13 +430,17 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
     const bool q6k    = src0->type == GGML_TYPE_Q6_K;
     const bool q2k    = src0->type == GGML_TYPE_Q2_K;
     const bool iq1m   = src0->type == GGML_TYPE_IQ1_M;
+    const bool mx8    = src0->type == GGML_TYPE_MXFP8;
+    const bool q40    = src0->type == GGML_TYPE_Q4_0;
+    const bool q20    = src0->type == GGML_TYPE_Q2_0;
+    const bool q80    = src0->type == GGML_TYPE_Q8_0;
     unsigned char * q8 = nullptr;
     float * as = nullptr;
     // A fused producer may have written this activation already. int8 types need signed-char
     // codes and fp8 types need e4m3, so accept the buffer only when its convention matches
     // the weight type; the producer records which one it wrote.
     const bool need_int8 = ptq1 || iq1s || iq4xs || iq3s || iq3xxs || iq2xxs || iq2xs ||
-                           iq2s || q4k || q6k || q2k || iq1m;
+                           iq2s || q4k || q6k || q2k || iq1m || q40 || q20 || q80;
     bool fused_int8 = false;
     const bool fused_hit = ggml_rad_fused_act_lookup(src1->data, K, (const unsigned char **) &q8,
                                                      (const float **) &as, &fused_int8);
@@ -433,7 +473,7 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
 
     ggml_cuda_radiance_gemm_f32(q8, w.W, w.Ws, w.Wref, as,
                                 (float *) dst->data, (int) M, (int) N, (int) K, stream,
-                                src0->type == GGML_TYPE_MXFP4_RAD, w.e6pack, ptq1, iq1s, iq4xs, iq3s, iq3xxs,
+                                src0->type == GGML_TYPE_MXFP4_RAD, w.e6pack, mx8, q40, q20, q80, ptq1, iq1s, iq4xs, iq3s, iq3xxs,
                                 iq2xxs, iq2xs, iq2s, q4k, q6k, q2k, iq1m);
     CUDA_CHECK(cudaGetLastError());
     return true;

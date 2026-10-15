@@ -16,6 +16,18 @@ void ggml_cuda_radiance_gather_scales_ptq1(const unsigned char * src, int N, int
 void ggml_cuda_radiance_gather_scales_mxfp6(const unsigned char * src, int N, int K,
                                             unsigned char * Wref, cudaStream_t stream);
 
+void ggml_cuda_radiance_gather_scales_mxfp8(const unsigned char * src, int N, int K,
+                                            unsigned char * Wref, cudaStream_t stream);
+
+void ggml_cuda_radiance_gather_scales_q80(const unsigned char * src, int N, int K,
+                                          unsigned char * Wref, cudaStream_t stream);
+
+// row max|w| for Q4_0 / Q2_0 zero-copy staging, fp16.
+void ggml_cuda_radiance_gather_scales_q40(const unsigned char * src, int N, int K,
+                                          unsigned char * Wref, cudaStream_t stream);
+void ggml_cuda_radiance_gather_scales_q20(const unsigned char * src, int N, int K,
+                                          unsigned char * Wref, cudaStream_t stream);
+
 void ggml_cuda_radiance_repack(const void * src_llama, int64_t s01, int N, int K,
                                void * W, void * Ws, void * Wref, cudaStream_t stream);
 
@@ -28,7 +40,8 @@ void ggml_cuda_radiance_quantize_tokens_i8(const float * x, int64_t sx, int64_t 
 
 void ggml_cuda_radiance_gemm_f32(const void * a_q, const void * w, const void * ws, const void * wref,
                                  const float * as, float * c, int M, int N, int K, cudaStream_t stream,
-                                 bool radsc = false, bool e6pack = false, bool ptq1 = false, bool iq1s = false,
+                                 bool radsc = false, bool e6pack = false, bool mx8 = false, bool q40 = false,
+                                 bool q20 = false, bool q80 = false, bool ptq1 = false, bool iq1s = false,
                                  bool iq4xs = false, bool iq3s = false, bool iq3xxs = false,
                                  bool iq2xxs = false, bool iq2xs = false, bool iq2s = false,
                                  bool q4k = false, bool q6k = false, bool q2k = false,
@@ -84,7 +97,8 @@ static inline bool ggml_cuda_radiance_is_int8_type(ggml_type type) {
            type == GGML_TYPE_IQ3_S  || type == GGML_TYPE_IQ3_XXS ||
            type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
            type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q2_K ||
-           type == GGML_TYPE_IQ1_M;
+           type == GGML_TYPE_IQ1_M || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q2_0 ||
+           type == GGML_TYPE_Q8_0;
 }
 
 // fused GLU fast path (B1): produce down-GEMM fp8 alongside y. lookup/registry span one graph.
