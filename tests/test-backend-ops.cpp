@@ -10789,6 +10789,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 512, 20*256, {1, 1}, {1, 1})); // real shape
     }
 
+    // Q8_R: radiance prefill only (no MMQ kernel of its own), so cover the small batches that
+    // MMVQ takes and the shapes that make the radiance gate engage.
+    for (int i = 1; i < 10; ++i) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_R, GGML_TYPE_F32, 16, i, 1*256,  {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_R, GGML_TYPE_F32, 16,   1, 16*256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_R, GGML_TYPE_F32, 16,   8, 16*256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_R, GGML_TYPE_F32, 512, 256, 5120,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_R, GGML_TYPE_F32, 2048, 256, 2560, {1, 1}, {1, 1}));
+
     for (ggml_type type_a : { GGML_TYPE_Q4_0_ROCMI4, GGML_TYPE_Q4_0_SYM4 }) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, i, 1*256, {1, 1}, {1, 1}));

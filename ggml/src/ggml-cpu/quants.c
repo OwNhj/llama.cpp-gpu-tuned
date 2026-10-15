@@ -54,6 +54,11 @@ void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
     quantize_row_q8_1_ref(x, y, k);
 }
 
+// Q8_R: Q8_0 block layout with one scale per row, so the ref quantiser handles the whole row.
+void quantize_row_q8_r(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q8_r_ref(x, y, k);
+}
+
 void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_mxfp4_ref(x, y, k);
 }

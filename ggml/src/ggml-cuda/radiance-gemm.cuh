@@ -19,7 +19,7 @@ void ggml_cuda_radiance_gather_scales_mxfp6(const unsigned char * src, int N, in
 void ggml_cuda_radiance_gather_scales_mxfp8(const unsigned char * src, int N, int K,
                                             unsigned char * Wref, cudaStream_t stream);
 
-void ggml_cuda_radiance_gather_scales_q80(const unsigned char * src, int N, int K,
+void ggml_cuda_radiance_gather_scales_q8r(const unsigned char * src, int N, int K,
                                           unsigned char * Wref, cudaStream_t stream);
 
 // row max|w| for Q4_0 / Q2_0 zero-copy staging, fp16.
@@ -41,7 +41,7 @@ void ggml_cuda_radiance_quantize_tokens_i8(const float * x, int64_t sx, int64_t 
 void ggml_cuda_radiance_gemm_f32(const void * a_q, const void * w, const void * ws, const void * wref,
                                  const float * as, float * c, int M, int N, int K, cudaStream_t stream,
                                  bool radsc = false, bool e6pack = false, bool mx8 = false, bool q40 = false,
-                                 bool q20 = false, bool q80 = false, bool ptq1 = false, bool iq1s = false,
+                                 bool q20 = false, bool q8r = false, bool ptq1 = false, bool iq1s = false,
                                  bool iq4xs = false, bool iq3s = false, bool iq3xxs = false,
                                  bool iq2xxs = false, bool iq2xs = false, bool iq2s = false,
                                  bool q4k = false, bool q6k = false, bool q2k = false,

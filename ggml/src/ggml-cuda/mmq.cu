@@ -249,16 +249,16 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
                                    src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K ||
                                    src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_IQ1_M ||
                                    src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q2_0 ||
-                                   src0->type == GGML_TYPE_Q8_0)
+                                   src0->type == GGML_TYPE_Q8_R)
                                 ? (size_t) 2 * N : (size_t) N;
-        if (src0->type == GGML_TYPE_Q8_0) {
+        if (src0->type == GGML_TYPE_Q8_R) {  // fold or exact share this staging
             // Q8_0 zero-copy: the staging folds each block's fp16 d against the row max, so
             // W aliases the 34-byte blocks and only Wref is materialised.
             w.own_w = false;
             w.W     = (unsigned char *) src0->data;
             w.Ws    = nullptr;
             CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
-            ggml_cuda_radiance_gather_scales_q80((const unsigned char *) src0->data, N, K,
+            ggml_cuda_radiance_gather_scales_q8r((const unsigned char *) src0->data, N, K,
                                                  (unsigned char *) w.Wref, stream);
         } else if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q2_0) {
             // Q4_0 / Q2_0 zero-copy: the staging reads the 18-byte blocks in place and folds
@@ -433,14 +433,14 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
     const bool mx8    = src0->type == GGML_TYPE_MXFP8;
     const bool q40    = src0->type == GGML_TYPE_Q4_0;
     const bool q20    = src0->type == GGML_TYPE_Q2_0;
-    const bool q80    = src0->type == GGML_TYPE_Q8_0;
+    const bool q8r    = src0->type == GGML_TYPE_Q8_R;
     unsigned char * q8 = nullptr;
     float * as = nullptr;
     // A fused producer may have written this activation already. int8 types need signed-char
     // codes and fp8 types need e4m3, so accept the buffer only when its convention matches
     // the weight type; the producer records which one it wrote.
     const bool need_int8 = ptq1 || iq1s || iq4xs || iq3s || iq3xxs || iq2xxs || iq2xs ||
-                           iq2s || q4k || q6k || q2k || iq1m || q40 || q20 || q80;
+                           iq2s || q4k || q6k || q2k || iq1m || q40 || q20 || q8r;
     bool fused_int8 = false;
     const bool fused_hit = ggml_rad_fused_act_lookup(src1->data, K, (const unsigned char **) &q8,
                                                      (const float **) &as, &fused_int8);
@@ -473,7 +473,7 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
 
     ggml_cuda_radiance_gemm_f32(q8, w.W, w.Ws, w.Wref, as,
                                 (float *) dst->data, (int) M, (int) N, (int) K, stream,
-                                src0->type == GGML_TYPE_MXFP4_RAD, w.e6pack, mx8, q40, q20, q80, ptq1, iq1s, iq4xs, iq3s, iq3xxs,
+                                src0->type == GGML_TYPE_MXFP4_RAD, w.e6pack, mx8, q40, q20, q8r, ptq1, iq1s, iq4xs, iq3s, iq3xxs,
                                 iq2xxs, iq2xs, iq2s, q4k, q6k, q2k, iq1m);
     CUDA_CHECK(cudaGetLastError());
     return true;
@@ -871,6 +871,13 @@ void ggml_cuda_mul_mat_q_fused_two(
     };
     launch_one(src0_a, dst_a);
     launch_one(src0_b, dst_b);
+}
+
+// Exported for the mul_mat dispatcher: Q8_R has no MMQ kernel, so a decline must fall back to
+// cuBLAS instead of entering the MMQ switch (which would abort on the default arm).
+bool ggml_cuda_radiance_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                  const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    return ggml_cuda_mul_mat_q_radiance(ctx, src0, src1, ids, dst);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

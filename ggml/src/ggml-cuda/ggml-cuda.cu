@@ -1974,6 +1974,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 #endif
+    // Q8_R has no MMQ kernel: radiance serves it, and anything radiance declines goes to
+    // dequant + cuBLAS. MMVQ already handled the small batches above.
+    if (src0->type == GGML_TYPE_Q8_R) {
+        if (!ggml_cuda_radiance_mul_mat_q(ctx, src0, src1, nullptr, dst)) {
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        }
+        return;
+    }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         // TEMP-DEBUG: bisect NaN — bypass MMQ for the huge-vocab logits mm
         if (src0->type == GGML_TYPE_PTQ1_0 && src0->ne[1] > 100000) {
@@ -6170,12 +6178,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
-                case GGML_GLU_OP_SWIGLU_CLAMP:
                     if (op->src[0]->type == GGML_TYPE_BF16 &&
-                            (ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU_OAI || ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU_CLAMP)) {
+                            ggml_get_glu_op(op) == GGML_GLU_OP_SWIGLU_OAI) {
                         return false;
                     }
                     return ggml_is_contiguous_1(op->src[0]);
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    // standalone SWIGLU_CLAMP has no CUDA kernel; it only exists fused into
+                    // the MMVQ/MMVF paths, so the op itself is not supported here.
+                    return false;
                 default:
                     return false;
             }
@@ -6219,6 +6230,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q8_R:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_MXFP4_RAD:
                     case GGML_TYPE_NVFP4:
@@ -6267,6 +6279,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q8_R:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
@@ -6595,8 +6608,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_DSV4_HC_POST:
+            // comb is optional: the identity case passes a null 4th source
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);

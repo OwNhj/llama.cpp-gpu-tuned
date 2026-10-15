@@ -6037,6 +6037,7 @@ class GGMLQuantizationType(IntEnum):
     MXFP6   = 45
     MXFP4_E4M3 = 46
     MXFP4_RAD = 47  # radiance plane layout (interleaved codes + row-major e8m0 scales)
+    Q8_R    = 48  # Q8_0 block layout with one fp16 scale per row (radiance)
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6226,6 +6227,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q5_0:    (32, 2 + 4 + 16),
     GGMLQuantizationType.Q5_1:    (32, 2 + 2 + 4 + 16),
     GGMLQuantizationType.Q8_0:    (32, 2 + 32),
+    GGMLQuantizationType.Q8_R:    (32, 2 + 32),  # same block as Q8_0, one scale per row
     GGMLQuantizationType.Q8_1:    (32, 2 + 2 + 32),
     GGMLQuantizationType.Q2_K:    (256, 2 + 2 + QK_K // 16 + QK_K // 4),
     GGMLQuantizationType.Q3_K:    (256, 2 + QK_K // 4 + QK_K // 8 + 12),

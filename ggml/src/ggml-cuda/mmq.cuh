@@ -101,6 +101,8 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
             return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_Q8_R:
+            return MMQ_Q8_1_DS_LAYOUT_D4; // same block layout as Q8_0
         default:
             GGML_ABORT("fatal error");
             break;
@@ -1877,6 +1879,9 @@ extern DECL_MMQ_CASE(GGML_TYPE_MXFP4_E4M3);
 // -------------------------------------------------------------------------------------------------------------------------
 
 void ggml_cuda_invalidate_weight_caches(const void * base, size_t size);
+
+bool ggml_cuda_radiance_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                  const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,

@@ -71,6 +71,7 @@ static const std::vector<quant_option> QUANT_OPTIONS = {
     { "Q5_K_M",   LLAMA_FTYPE_MOSTLY_Q5_K_M,   " 5.33G, +0.0569 ppl @ Llama-3-8B",  },
     { "Q6_K",     LLAMA_FTYPE_MOSTLY_Q6_K,     " 6.14G, +0.0217 ppl @ Llama-3-8B",  },
     { "Q8_0",     LLAMA_FTYPE_MOSTLY_Q8_0,     " 7.96G, +0.0026 ppl @ Llama-3-8B",  },
+    { "Q8_R",     LLAMA_FTYPE_MOSTLY_Q8_R,     " 8.5 bpw Q8 with one scale per row (radiance)", },
     { "MXFP8",    LLAMA_FTYPE_MOSTLY_MXFP8,    " 8.25 bpw MX FP8 (OCP, E4M3 + E8M0)", },
     { "MXFP6",    LLAMA_FTYPE_MOSTLY_MXFP6,    " 6.25 bpw MX FP6 (OCP, E2M3 + E8M0)", },
     { "MXFP4_E4M3", LLAMA_FTYPE_MOSTLY_MXFP4_E4M3, " 4.25 bpw MX FP4 with a UE4M3 block scale", },

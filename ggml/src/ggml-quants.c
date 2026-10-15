@@ -800,6 +800,29 @@ static void quantize_row_mxfp8_impl(const float * GGML_RESTRICT x, block_mxfp8 *
     }
 }
 
+// Q8_R: block_q8_0 layout, but one scale for the whole row. Callers quantise one row at a
+// time (k == row length); every block gets the same d and q = rint(w/d) in [-127, 127].
+void quantize_row_q8_r_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK8_0 == 0);
+    const int64_t nb = k / QK8_0;
+
+    float amax = 0.0f;
+    for (int64_t i = 0; i < k; ++i) {
+        const float a = fabsf(x[i]);
+        if (a > amax) amax = a;
+    }
+    const float d  = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const float id = 1.0f / d;
+    for (int64_t b = 0; b < nb; ++b) {
+        y[b].d = GGML_FP32_TO_FP16(d);
+        for (int j = 0; j < QK8_0; ++j) {
+            int v = (int) rintf(x[b * QK8_0 + j] * id);
+            v = v < -127 ? -127 : (v > 127 ? 127 : v);
+            y[b].qs[j] = (int8_t) v;
+        }
+    }
+}
+
 void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
     static const int qk      = QK_MXFP8;
     static const int qk_sub  = QK_MXFP8_SUB;
@@ -3264,6 +3287,17 @@ size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     (void)quant_weights; // not used
     const size_t row_size = ggml_row_size(GGML_TYPE_Q8_0, n_per_row);
     quantize_row_q8_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_q8_r(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // not used
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_R, n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q8_r_ref(src + row * n_per_row, (block_q8_0 *) qrow, n_per_row);
+        qrow += row_size;
+    }
     return nrow * row_size;
 }
 
@@ -6597,6 +6631,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q5_1, data, nb, d, m);
             } break;
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_R:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q8_0, data, nb);
             } break;

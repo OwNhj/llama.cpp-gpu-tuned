@@ -650,6 +650,7 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
         case GGML_TYPE_Q5_1:
             return dequantize_block_cont_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_R:
             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_F8:
             return dequantize_block_cont_cuda<QK_F8, QR_F8, dequantize_f8>;
@@ -727,6 +728,7 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_Q5_1:
             return dequantize_block_cont_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_R:
             if (fp16_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
                 return dequantize_block_q8_0_f16_cuda;
             }
@@ -807,6 +809,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
         case GGML_TYPE_Q5_1:
             return dequantize_block_cont_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_R:
             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_F8:
             return dequantize_block_cont_cuda<QK_F8, QR_F8, dequantize_f8>;
