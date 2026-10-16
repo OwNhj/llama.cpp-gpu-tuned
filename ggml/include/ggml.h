@@ -442,6 +442,7 @@ extern "C" {
         GGML_TYPE_Q4_0_SYM4         = 107, // same block, symmetric grid (n+0.5)*s -- no exact zero
         // Prism-private ternary family at group size 128 (type ids above all upstream types).
         GGML_TYPE_Q8_R   = 48,  // Q8_0 layout with one fp16 scale per row (radiance-friendly)
+        GGML_TYPE_E4M3_RAD = 49, // E4M3 codes folded to one fp16 row scale (radiance plane layout), opaque
         GGML_TYPE_PQ2_0  = 142, // Prism-private Q2_0 at group 128 (2.13 bpw)
         GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary at group 128 (1.75 bpw)
         GGML_TYPE_COUNT   = 144,
@@ -502,6 +503,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
         GGML_FTYPE_MOSTLY_PQ2_0  = 128, // except 1d tensors (Prism-private group-128 Q2_0)
         GGML_FTYPE_MOSTLY_Q8_R   = 130, // except 1d tensors (Q8_0 layout, one scale per row)
+        GGML_FTYPE_MOSTLY_E4M3_RAD = 131, // except 1d tensors (E4M3 codes on one row scale)
         GGML_FTYPE_MOSTLY_PTQ1_0 = 129, // except 1d tensors (Prism-private group-128 ternary)
         GGML_FTYPE_MOSTLY_Q4_0_ROCMI4           = 118, // native signed 4-bit integer path
         GGML_FTYPE_MOSTLY_Q4_0_SYM4              = 119, // symmetric 4-bit grid, 17 B block, 4.25 bpw

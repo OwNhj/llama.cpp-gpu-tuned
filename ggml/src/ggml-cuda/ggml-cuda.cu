@@ -1836,7 +1836,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    // E4M3_RAD has no MMVQ kernel (radiance or cuBLAS serves it), so it must not fuse here.
+    const bool mmvq_decode_ok = ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_E4M3_RAD;
+    bool use_mul_mat_vec_q = mmvq_decode_ok && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // fusion is not universally faster on Pascal
@@ -1974,6 +1976,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 #endif
+    // E4M3_RAD is the fp8 counterpart of Q8_R: radiance or nothing, then cuBLAS.
+    if (src0->type == GGML_TYPE_E4M3_RAD) {
+        if (!ggml_cuda_radiance_mul_mat_q(ctx, src0, src1, nullptr, dst)) {
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        }
+        return;
+    }
     // Q8_R has no MMQ kernel: radiance serves it, and anything radiance declines goes to
     // dequant + cuBLAS. MMVQ already handled the small batches above.
     if (src0->type == GGML_TYPE_Q8_R) {
@@ -6231,6 +6240,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_Q8_R:
+                    case GGML_TYPE_E4M3_RAD:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_MXFP4_RAD:
                     case GGML_TYPE_NVFP4:
@@ -6280,6 +6290,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_Q8_R:
+                    case GGML_TYPE_E4M3_RAD:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:

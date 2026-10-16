@@ -540,6 +540,22 @@ static void dequantize_row_mxfp8_cuda(const void * vx, dst_t * y, const int64_t 
     dequantize_block_mxfp8<<<nb, 32, 0, stream>>>(vx, y);
 }
 
+// E4M3_RAD plane dequant: k is the element count, which equals the code-plane size, so one
+// flat kernel decodes the whole tensor.
+template<typename dst_t>
+static __global__ void dequantize_block_e4m3_rad(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t n) {
+    const unsigned char * base = (const unsigned char *) vx;
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        yy[i] = (dst_t) e4m3_rad_at(base, i);
+    }
+}
+
+template<typename dst_t>
+static void dequantize_row_e4m3_rad_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int64_t nblocks = (k + 255) / 256;
+    dequantize_block_e4m3_rad<dst_t><<<(unsigned) nblocks, 256, 0, stream>>>(vx, y, k);
+}
+
 // NOTE: the ROCMFP4 / ROCMFP4_FAST dequantize kernels and their launchers were removed:
 // the ROCMFP family was dropped and the only references left were unreachable `return`
 // statements from deleted case labels, which also force-instantiated these templates.
@@ -690,6 +706,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_mxfp6_cuda;
         case GGML_TYPE_MXFP8:
             return dequantize_row_mxfp8_cuda;
+        case GGML_TYPE_E4M3_RAD:
+            return dequantize_row_e4m3_rad_cuda;
         case GGML_TYPE_Q4_0_ROCMI4:
             return dequantize_block_cont_cuda<QK_ROCMI4, QR_ROCMI4, dequantize_rocmi4>;
         case GGML_TYPE_Q4_0_SYM4:
@@ -771,6 +789,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_mxfp6_cuda;
         case GGML_TYPE_MXFP8:
             return dequantize_row_mxfp8_cuda;
+        case GGML_TYPE_E4M3_RAD:
+            return dequantize_row_e4m3_rad_cuda;
         case GGML_TYPE_Q4_0_ROCMI4:
             return dequantize_block_cont_cuda<QK_ROCMI4, QR_ROCMI4, dequantize_rocmi4>;
         case GGML_TYPE_Q4_0_SYM4:
@@ -849,6 +869,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_mxfp6_cuda;
         case GGML_TYPE_MXFP8:
             return dequantize_row_mxfp8_cuda;
+        case GGML_TYPE_E4M3_RAD:
+            return dequantize_row_e4m3_rad_cuda;
         case GGML_TYPE_Q4_0_ROCMI4:
             return dequantize_block_cont_cuda<QK_ROCMI4, QR_ROCMI4, dequantize_rocmi4>;
         case GGML_TYPE_Q4_0_SYM4:

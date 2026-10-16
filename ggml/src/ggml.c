@@ -927,6 +927,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4_e4m3,
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_e4m3_ref,
     },
+    [GGML_TYPE_E4M3_RAD] = {
+        .type_name                = "e4m3_rad",
+        .blck_size                = 256,
+        .type_size                = 264, // 256 e4m3 codes + a 2-byte row scale + 6 pad = 8.25 bpw
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_e4m3_rad,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_e4m3_rad_ref,
+    },
     [GGML_TYPE_F8] = {
         .type_name                = "f8",
         .blck_size                = QK_F8,
@@ -8278,6 +8286,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP8:   result = quantize_mxfp8  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_E4M3_RAD: result = quantize_e4m3_rad(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_R:    result = quantize_q8_r  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP6:   result = quantize_mxfp6  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4_E4M3: result = quantize_mxfp4_e4m3 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

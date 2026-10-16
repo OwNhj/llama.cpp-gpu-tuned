@@ -356,6 +356,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11, int64_
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    // E4M3_RAD has no MMVQ kernel: its decode is radiance or cuBLAS, so decline here.
+    if (type == GGML_TYPE_E4M3_RAD) {
+        return false;
+    }
     // GGML_RAD_DECODE=1: let the radiance decode kernel (not MMVQ) own MXFP4_RAD decode so the
     // code/scale planes are read directly -> no unrad raw copy on the device.
     if (type == GGML_TYPE_MXFP4_RAD && getenv("GGML_RAD_DECODE")) {

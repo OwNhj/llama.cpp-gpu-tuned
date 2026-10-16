@@ -249,7 +249,7 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
                                    src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K ||
                                    src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_IQ1_M ||
                                    src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q2_0 ||
-                                   src0->type == GGML_TYPE_Q8_R)
+                                   src0->type == GGML_TYPE_Q8_R || src0->type == GGML_TYPE_E4M3_RAD)
                                 ? (size_t) 2 * N : (size_t) N;
         if (src0->type == GGML_TYPE_Q8_R) {  // fold or exact share this staging
             // Q8_0 zero-copy: the staging folds each block's fp16 d against the row max, so
@@ -273,6 +273,15 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
             else
                 ggml_cuda_radiance_gather_scales_q20((const unsigned char *) src0->data, N, K,
                                                      (unsigned char *) w.Wref, stream);
+        } else if (src0->type == GGML_TYPE_E4M3_RAD) {
+            // E4M3_RAD zero-copy: the codes are already folded onto the row scale, so W
+            // aliases the tensor and only the fp16 row scales are gathered.
+            w.own_w = false;
+            w.W     = (unsigned char *) src0->data;
+            w.Ws    = nullptr;
+            CUDA_CHECK(cudaMalloc(&w.Wref, wref_bytes));
+            ggml_cuda_radiance_gather_scales_e4r((const unsigned char *) src0->data, N, K,
+                                                 (unsigned char *) w.Wref, stream);
         } else if (src0->type == GGML_TYPE_MXFP8) {
             // MXFP8 zero-copy: W aliases the checkpoint's 264-byte blocks; the atiled MX8
             // staging folds each block's e8m0 into its e4m3 bytes. Only Wref (row max e,
@@ -430,7 +439,7 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
     const bool q6k    = src0->type == GGML_TYPE_Q6_K;
     const bool q2k    = src0->type == GGML_TYPE_Q2_K;
     const bool iq1m   = src0->type == GGML_TYPE_IQ1_M;
-    const bool mx8    = src0->type == GGML_TYPE_MXFP8;
+    const bool e4r    = src0->type == GGML_TYPE_E4M3_RAD;
     const bool q40    = src0->type == GGML_TYPE_Q4_0;
     const bool q20    = src0->type == GGML_TYPE_Q2_0;
     const bool q8r    = src0->type == GGML_TYPE_Q8_R;
@@ -473,7 +482,7 @@ static bool ggml_cuda_mul_mat_q_radiance(ggml_backend_cuda_context & ctx, const 
 
     ggml_cuda_radiance_gemm_f32(q8, w.W, w.Ws, w.Wref, as,
                                 (float *) dst->data, (int) M, (int) N, (int) K, stream,
-                                src0->type == GGML_TYPE_MXFP4_RAD, w.e6pack, mx8, q40, q20, q8r, ptq1, iq1s, iq4xs, iq3s, iq3xxs,
+                                src0->type == GGML_TYPE_MXFP4_RAD, w.e6pack, e4r, q40, q20, q8r, ptq1, iq1s, iq4xs, iq3s, iq3xxs,
                                 iq2xxs, iq2xs, iq2s, q4k, q6k, q2k, iq1m);
     CUDA_CHECK(cudaGetLastError());
     return true;

@@ -3335,6 +3335,42 @@ size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * row_size;
 }
 
+size_t quantize_e4m3_rad(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    // Plane layout: all N*K e4m3 codes first, then the fp16 scales, so every 16-byte code run
+    // stays 16-aligned for the uint4 staging loads. One scale covers 256 elements and is chosen
+    // from that block's own amax (a real float, not a power of two, which is the point of the
+    // format: the codes are folded once here and the kernel never folds again).
+    (void) quant_weights; // the block scale is the block amax; imatrix does not change it
+    const int64_t nb = n_per_row / 256;
+    // One 264-byte block per 256 elements: the codes, then the row scale in the block's scale
+    // slot. The row stride follows from ggml_row_size.
+    const size_t rw = (size_t) nb * 264;
+    unsigned char * qrow = (unsigned char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        float amax = 0.0f;
+        for (int64_t i = 0; i < n_per_row; ++i) {
+            const float a = fabsf(src[i]);
+            if (a > amax) amax = a;
+        }
+        const float d = amax > 0.0f ? amax / 448.0f : 1.0f;
+        const float id = 1.0f / d;
+        const ggml_half dh = GGML_FP32_TO_FP16(d);
+        for (int64_t b = 0; b < nb; ++b) {
+            unsigned char * blk = qrow + (size_t) b * 264;
+            for (int64_t i = 0; i < 256; ++i) {
+                blk[i] = ggml_fp32_to_e4m3(src[b * 256 + i] * id);
+            }
+            *(ggml_half *) (blk + 256) = dh;
+            for (int64_t i = 258; i < 264; ++i) {
+                blk[i] = 0;
+            }
+        }
+        qrow += rw;
+        src  += n_per_row;
+    }
+    return (size_t) nrow * rw;
+}
+
 size_t quantize_mxfp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     const size_t row_size = ggml_row_size(GGML_TYPE_MXFP8, n_per_row);
 
@@ -6635,6 +6671,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q8_0, data, nb);
             } break;
+        case GGML_TYPE_E4M3_RAD:
+            {
+                // Plane layout: reject only the e4m3 NaN pattern (exponent all ones, i.e.
+                // (byte & 0x7f) == 0x7f), which the quantiser never emits.
+                const uint8_t * c = (const uint8_t *) data;
+                for (size_t i = 0; i < nbytes; ++i) {
+                    if ((c[i] & 0x7F) == 0x7F) {
+                        fprintf(stderr, "%s: invalid e4m3 code 0x%02x at byte %zu\n", __func__, c[i], i);
+                        return false;
+                    }
+                }
+            } break;
         case GGML_TYPE_MXFP4:
             {
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp4, data, nb);
@@ -6797,6 +6845,85 @@ void dequantize_row_mxfp4_rad_row(const void * GGML_RESTRICT base, int64_t nrows
             y[b*qk + 2*m + 1]      = kvalues_mxfp4[q[m] >> 4]*d;
             y[b*qk + 16 + 2*m + 0] = kvalues_mxfp4[q[8+m] & 0x0F]*d;
             y[b*qk + 16 + 2*m + 1] = kvalues_mxfp4[q[8+m] >> 4]*d;
+        }
+    }
+}
+
+// E4M3 radiance plane layout. One tensor row of k elements is k e4m3 bytes (codes already
+// folded onto the row scale) followed by one fp16 scale; the CUDA fast path copies the codes
+// and applies the scale in its epilogue.
+static const float kvalues_e4m3_rad[128] = {
+    0.0f,
+    0.001953125f, 0.00390625f, 0.005859375f, 0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,
+    0.015625f,    0.017578125f, 0.01953125f, 0.021484375f, 0.0234375f, 0.025390625f, 0.02734375f, 0.029296875f,
+    0.03125f,     0.03515625f,  0.0390625f,  0.04296875f,  0.046875f,  0.05078125f,  0.0546875f,  0.05859375f,
+    0.0625f,      0.0703125f,   0.078125f,   0.0859375f,   0.09375f,   0.1015625f,   0.109375f,   0.1171875f,
+    0.125f,       0.140625f,    0.15625f,    0.171875f,    0.1875f,    0.203125f,    0.21875f,    0.234375f,
+    0.25f,        0.28125f,     0.3125f,     0.34375f,     0.375f,     0.40625f,     0.4375f,     0.46875f,
+    0.5f,         0.5625f,      0.625f,      0.6875f,      0.75f,      0.8125f,      0.875f,      0.9375f,
+    1.0f,         1.125f,       1.25f,       1.375f,       1.5f,       1.625f,       1.75f,       1.875f,
+    2.0f,         2.25f,        2.5f,        2.75f,        3.0f,       3.25f,        3.5f,       3.75f,
+    4.0f,         4.5f,         5.0f,        5.5f,         6.0f,       6.5f,         7.0f,       7.5f,
+    8.0f,         9.0f,         10.0f,       11.0f,        12.0f,      13.0f,        14.0f,      15.0f,
+    16.0f,        18.0f,        20.0f,       22.0f,        24.0f,      26.0f,        28.0f,      30.0f,
+    32.0f,        36.0f,        40.0f,       44.0f,        48.0f,      52.0f,        56.0f,      60.0f,
+    64.0f,        72.0f,        80.0f,       88.0f,        96.0f,      104.0f,       112.0f,     120.0f,
+    128.0f,       144.0f,       160.0f,      176.0f,       192.0f,     208.0f,       224.0f,     240.0f,
+    256.0f,       288.0f,       320.0f,      352.0f,       384.0f,     416.0f,       448.0f,     0.0f,
+};
+
+void dequantize_row_e4m3_rad(const void * GGML_RESTRICT vx, float * GGML_RESTRICT y, int64_t k) {
+    // One row of 264-byte blocks: each block is 256 codes followed by its scale slot.
+    const uint8_t * base = (const uint8_t *) vx;
+    for (int64_t b = 0; b < k / 256; ++b) {
+        const uint8_t * blk = base + (size_t) b * 264;
+        const float d = GGML_FP16_TO_FP32(*(const ggml_half *) (blk + 256));
+        for (int64_t i = 0; i < 256; ++i) {
+            const int8_t c = (int8_t) blk[i];
+            const float m = kvalues_e4m3_rad[(uint8_t) c & 0x7F];
+            y[b * 256 + i] = (c < 0 ? -m : m) * d;
+        }
+    }
+}
+
+void dequantize_row_e4m3_rad_row(const void * GGML_RESTRICT base, int64_t nrows,
+                                 int64_t i01, int64_t K, float * GGML_RESTRICT y) {
+    GGML_UNUSED(nrows);
+    const int64_t nb = K / 256;
+    const uint8_t * row = (const uint8_t *) base + (size_t) i01 * nb * 264;
+    for (int64_t b = 0; b < nb; ++b) {
+        const uint8_t * blk = row + (size_t) b * 264;
+        const float d = GGML_FP16_TO_FP32(*(const ggml_half *) (blk + 256));
+        for (int64_t i = 0; i < 256; ++i) {
+            const int8_t c = (int8_t) blk[i];
+            const float m = kvalues_e4m3_rad[(uint8_t) c & 0x7F];
+            y[b * 256 + i] = (c < 0 ? -m : m) * d;
+        }
+    }
+}
+
+// One rounding straight onto the row scale: fold the whole row first, then pick the nearest
+// e4m3 code. This is the point of the format, so it never quantises per block and then shifts.
+void quantize_row_e4m3_rad_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    // One row: K/256 blocks of [256 e4m3 codes][fp16 row scale][6 pad]. The scale is the row
+    // amax / 448, and it is repeated in every block of the row.
+    float amax = 0.0f;
+    for (int64_t i = 0; i < k; ++i) {
+        const float a = fabsf(x[i]);
+        if (a > amax) amax = a;
+    }
+    const float d = amax > 0.0f ? amax / 448.0f : 1.0f;
+    const float id = 1.0f / d;
+    uint8_t * qrow = (uint8_t *) y;
+    const ggml_half dh = GGML_FP32_TO_FP16(d);
+    for (int64_t b = 0; b < k / 256; ++b) {
+        uint8_t * blk = qrow + (size_t) b * 264;
+        for (int64_t i = 0; i < 256; ++i) {
+            blk[i] = ggml_fp32_to_e4m3(x[b * 256 + i] * id);
+        }
+        *(ggml_half *) (blk + 256) = dh;
+        for (int64_t i = 258; i < 264; ++i) {
+            blk[i] = 0;
         }
     }
 }

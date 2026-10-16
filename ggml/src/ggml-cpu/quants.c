@@ -59,6 +59,41 @@ void quantize_row_q8_r(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q8_r_ref(x, y, k);
 }
 
+// E4M3_RAD: codes are folded onto the block scale, so the CPU dot only has to decode them.
+void quantize_row_e4m3_rad(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_e4m3_rad_ref(x, y, k);
+}
+
+static inline float e4m3_rad_mag(uint8_t c) {
+    const int e = (c >> 3) & 0x0F, m = c & 0x07;
+    return e == 0 ? (m / 8.0f) * (1.0f / 64.0f) : (1.0f + m / 8.0f) * exp2f((float) (e - 7));
+}
+
+void ggml_vec_dot_e4m3_rad_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+                                        const void * GGML_RESTRICT vx, size_t bx,
+                                        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK8_0 == 0);
+    assert(nrc == 1);
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by);
+
+    const uint8_t * x = (const uint8_t *) vx;      // 264-byte blocks: 256 codes + the scale
+    const block_q8_0 * y = (const block_q8_0 *) vy;
+
+    float sumf = 0.0f;
+    for (int64_t b = 0; b < n / 256; ++b) {
+        const uint8_t * blk = x + b * 264;
+        const float dw = GGML_FP16_TO_FP32(*(const ggml_half *) (blk + 256));
+        for (int i = 0; i < 256; ++i) {
+            const int8_t c = (int8_t) blk[i];
+            const float m = e4m3_rad_mag((uint8_t) c & 0x7F);
+            const int64_t e = b * 256 + i;
+            const block_q8_0 * yb = &y[e / QK8_0];
+            sumf += (c < 0 ? -m : m) * dw * GGML_FP16_TO_FP32(yb->d) * (float) yb->qs[e % QK8_0];
+        }
+    }
+    *s = sumf;
+}
+
 void quantize_row_mxfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_mxfp4_ref(x, y, k);
 }

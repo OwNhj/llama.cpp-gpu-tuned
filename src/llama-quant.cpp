@@ -1152,6 +1152,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
         case LLAMA_FTYPE_MOSTLY_Q8_R:     return GGML_TYPE_Q8_R;
+        case LLAMA_FTYPE_MOSTLY_E4M3_RAD: return GGML_TYPE_E4M3_RAD;
         case LLAMA_FTYPE_MOSTLY_MXFP8:     return GGML_TYPE_MXFP8;
         case LLAMA_FTYPE_MOSTLY_MXFP6:     return GGML_TYPE_MXFP6;
         case LLAMA_FTYPE_MOSTLY_MXFP4_E4M3: return GGML_TYPE_MXFP4_E4M3;

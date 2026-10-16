@@ -705,6 +705,24 @@ static __device__ __forceinline__ void dequantize_mxfp8_elem(const void * vx, co
     v.y = mxfp8_elem_at(x, iqs + 1);
 }
 
+// E4M3_RAD: 264-byte blocks of [256 e4m3 codes][fp16 row scale][pad], so element i lives in
+// block i/256 at offset i%256 and uses that block's scale slot.
+static __device__ __forceinline__ float e4m3_rad_at(const unsigned char * base, const int64_t i) {
+    const unsigned char * blk = base + (i / 256) * 264;
+    const unsigned char c = blk[i % 256];
+    const float d = __half2float(*(const __half *) (blk + 256));
+    const float m = ggml_cuda_e4m3x2_to_fp32(c & 0x7F, 0).x;
+    return (c & 0x80) ? -m * d : m * d;
+}
+
+// Unused: E4M3_RAD is only registered on the contiguous dequant path. Kept so the block-typed
+// dispatch table compiles if it is ever re-enabled.
+static __device__ __forceinline__ void dequantize_e4m3_rad_elem(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    GGML_UNUSED(vx); GGML_UNUSED(ib); GGML_UNUSED(iqs);
+    v.x = 0.0f;
+    v.y = 0.0f;
+}
+
 // One E2M3 element of a mxfp6 block: sub-block e[s] * (1/8) * kvalues, code at bit 6*i in
 // the little-endian 6-bit stream. Shared by the block and elementwise dequant paths.
 static __device__ __forceinline__ float mxfp6_elem_at(const block_mxfp6 * x, const int i) {

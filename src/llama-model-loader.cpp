@@ -801,6 +801,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_MXFP6:   ftype = LLAMA_FTYPE_MOSTLY_MXFP6;   break;
             case GGML_TYPE_MXFP4_E4M3: ftype = LLAMA_FTYPE_MOSTLY_MXFP4_E4M3; break;
             case GGML_TYPE_Q8_R:    ftype = LLAMA_FTYPE_MOSTLY_Q8_R;    break;
+            case GGML_TYPE_E4M3_RAD: ftype = LLAMA_FTYPE_MOSTLY_E4M3_RAD; break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
