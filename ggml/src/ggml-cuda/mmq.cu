@@ -134,7 +134,6 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -866,6 +865,27 @@ void ggml_cuda_mul_mat_q_fused_two(
 
     const int64_t stride_q_channel = ne11*ne10_padded*sizeof(block_q8_1_mmq)/(QK8_1_MMQ*sizeof(int));
     const int64_t stride_q_sample = ne12*stride_q_channel;
+
+    // The tile width is picked from the number of x tiles, as in the dense path.
+    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    int J_best        = 0;
+    int ntiles_J_best = INT_MAX;
+    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0_a->type, J, fallback, cc, GGML_PREC_Q8);
+        if (config.type == GGML_TYPE_COUNT) {
+            continue;
+        }
+        if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+            continue;
+        }
+        const int ntiles_x = (ne11 + config.J - 1) / config.J;
+        if (ntiles_x < ntiles_J_best) {
+            J_best = J;
+            ntiles_J_best = ntiles_x;
+        }
+    }
+    GGML_ASSERT(J_best > 0);
+
     auto launch_one = [&](const ggml_tensor * src0, ggml_tensor * dst) {
         GGML_ASSERT(src0->type == src0_a->type && src0->ne[0] == ne10);
         const size_t ts0 = ggml_type_size(src0->type);
@@ -875,7 +895,7 @@ void ggml_cuda_mul_mat_q_fused_two(
             src0->ne[0], src0->ne[1], dst->ne[1], (int64_t)(src0->nb[1]/ts0), ne11, (int64_t)(dst->nb[1]/sizeof(float)),
             src0->ne[2], ne12, (int64_t)(src0->nb[2]/ts0), stride_q_channel, (int64_t)(dst->nb[2]/sizeof(float)),
             src0->ne[3], ne13, (int64_t)(src0->nb[3]/ts0), stride_q_sample, (int64_t)(dst->nb[3]/sizeof(float)),
-            dst->ne[1]};
+            dst->ne[1], J_best};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
     };
     launch_one(src0_a, dst_a);

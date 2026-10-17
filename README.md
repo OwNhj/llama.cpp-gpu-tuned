@@ -46,11 +46,9 @@
 
 This fork adds default-off offline quantization tooling: per-tensor quant error
 reporting (`llama-quantize --tt-errors`), Hessian collection
-(`llama-imatrix --hessian-dir`), GPTQ-style requantization
-(`llama-quantize --gptq-u-dir`), and on the Radiance branch fused gate|up
-weights and the MXFP4_RAD radiance-plane storage type. See
-[CALIBRATION.md](CALIBRATION.md) for commands, env switches, and measured
-results.
+(`llama-imatrix --hessian-dir`) and GPTQ-style requantization
+(`llama-quantize --gptq-u-dir`). See [CALIBRATION.md](CALIBRATION.md) for
+commands, corpus-shape notes and measured results.
 
 ## Building with the F8 KV cache
 >
