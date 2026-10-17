@@ -2683,9 +2683,44 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// True when every MUL_MAT in the graph has few activation rows, i.e. the graph is a decode step
+// rather than a prefill batch. Graphs help prefill and hurt decode (see the note at the call site).
+static bool ggml_cuda_graph_decode_shaped(ggml_cgraph * cgraph) {
+    static const int64_t threshold = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_DECODE_MAX_M");
+        return env ? (int64_t) atoll(env) : (int64_t) 16;
+    }();
+
+    if (threshold <= 0) {
+        return false;
+    }
+
+    bool any = false;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT || node->src[1] == nullptr) {
+            continue;
+        }
+        any = true;
+        if (node->src[1]->ne[1] > threshold) {
+            return false;
+        }
+    }
+    return any;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+
+    // HIP graph replay costs more than the launches it saves on a decode-shaped graph: the gap
+    // between nodes is GPU-side scheduling, not host launch latency, so batching the whole graph
+    // into one submit makes it slower. Measured on gfx1201 (RDNA4), dflash n_max=7 (M=8):
+    // 76.10 t/s without graphs vs 72.45 with, identical output. Only skip graphs for graphs whose
+    // mats are all narrow (decode); prefill keeps them.
+    if (ggml_cuda_graph_decode_shaped(cgraph)) {
+        return false;
+    }
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
