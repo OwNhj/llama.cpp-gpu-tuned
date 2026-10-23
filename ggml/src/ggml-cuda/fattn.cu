@@ -436,6 +436,19 @@ typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor *
 static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K_in, const ggml_type type_V_in) {
     const ggml_type type_K = type_K_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_K_in;
     const ggml_type type_V = type_V_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_V_in;
+    FATTN_VEC_CASES_ALL_D(NVFP4, NVFP4)
+    FATTN_VEC_CASES_ALL_D(Q8_0, NVFP4)
+    FATTN_VEC_CASES_ALL_D(NVFP4, Q8_0)
+    FATTN_VEC_CASES_ALL_D(F8,   NVFP4)
+    FATTN_VEC_CASES_ALL_D(NVFP4, F8)
+    FATTN_VEC_CASES_ALL_D(F16,  NVFP4)
+    FATTN_VEC_CASES_ALL_D(NVFP4, F16)
+    FATTN_VEC_CASES_ALL_D(BF16, NVFP4)
+    FATTN_VEC_CASES_ALL_D(NVFP4, BF16)
+    FATTN_VEC_CASES_ALL_D(Q4_0, NVFP4)
+    FATTN_VEC_CASES_ALL_D(Q4_1, NVFP4)
+    FATTN_VEC_CASES_ALL_D(Q5_0, NVFP4)
+    FATTN_VEC_CASES_ALL_D(Q5_1, NVFP4)
     FATTN_VEC_CASES_ALL_D(F8,   F8)
     FATTN_VEC_CASES_ALL_D(F8,   F16)
     FATTN_VEC_CASES_ALL_D(Q8_0, F8)
