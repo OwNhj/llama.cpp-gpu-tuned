@@ -423,6 +423,84 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
     }
 }
 
+
+// NVFP4 KV in the vector kernel (decode path). block_nvfp4 = 64 elements: uint8_t d[4]
+// (one UE4M3 per 16-element sub-block) + uint8_t qs[32]. Inside a sub-block, byte b holds
+// element b in the low nibble and element 8+b in the high nibble (half-split like q4_0).
+// kvalues_mxfp4 stores 2x the e2m1 values and ggml_cuda_ue4m3_to_fp32 folds the 1/2, so
+// their product is the true value and no bias correction is needed (signed-symmetric code).
+// One k_KQ unit = 4 consecutive elements = int32 lane group of Q's q8_1 word. For unit index
+// k (element 4k..4k+3): block ib=k/16, unit q=k%16, sub-block s=q/4, m=q%4. The 4 elements
+// live in qs int32 word (2s + m%2), in tab.x for m<2 and tab.y for m>=2.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_nvfp4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    GGML_UNUSED(Q_v);
+
+    const block_nvfp4 * K_blk = (const block_nvfp4 *) K_c;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib = k_KQ / (QK_NVFP4/4);
+        const int q  = k_KQ % (QK_NVFP4/4);
+        const int s  = q / 4;
+        const int m  = q % 4;
+
+        int w;
+        ggml_cuda_memcpy_1<sizeof(w), 2>(&w, (const int *) K_blk[ib].qs + 2*s + (m & 1));
+        const int2 tab = get_int_from_table_16(w, kvalues_mxfp4);
+        const int  v   = (m < 2) ? tab.x : tab.y;
+
+        const int sumi = ggml_cuda_dp4a(v, Q_q8[k_KQ_0/nthreads], 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += ggml_cuda_ue4m3_to_fp32(K_blk[ib].d[s]) * Q_ds.x * float(sumi);
+    }
+
+    return sum;
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_nvfp4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    static_assert(ne == 4, "bad ne"); // 4 consecutive elements per unit
+
+    const block_nvfp4 * x = (const block_nvfp4 *) vx;
+
+    const int64_t ib = i0 / QK_NVFP4;
+    const int     q  = (int) (i0 % QK_NVFP4) / 4;
+    const int     s  = q / 4;
+    const int     m  = q % 4;
+
+    int w;
+    ggml_cuda_memcpy_1<sizeof(w), 2>(&w, (const int *) x[ib].qs + 2*s + (m & 1));
+    const int2 tab = get_int_from_table_16(w, kvalues_mxfp4);
+    const int  v32 = (m < 2) ? tab.x : tab.y;
+
+    const float d = ggml_cuda_ue4m3_to_fp32(x[ib].d[s]);
+    const int8_t * q8 = (const int8_t *) &v32;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 dh = __float2half2_rn(d);
+        ((half2 *) dst)[0] = dh * make_half2(q8[0], q8[1]);
+        ((half2 *) dst)[1] = dh * make_half2(q8[2], q8[3]);
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+        ((float *) dst)[0] = d * q8[0];
+        ((float *) dst)[1] = d * q8[1];
+        ((float *) dst)[2] = d * q8[2];
+        ((float *) dst)[3] = d * q8[3];
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
 typedef void (*dequantize_V_t)(const void *, void *, const int64_t);
 
 template <typename T, int ne>
@@ -724,6 +802,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_NVFP4) {
+        return vec_dot_fattn_vec_KQ_nvfp4<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_F8) {
         return vec_dot_fattn_vec_KQ_f8<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
@@ -748,6 +828,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_NVFP4) {
+        return dequantize_V_nvfp4<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_F8) {
         return dequantize_V_f8<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
